@@ -1,0 +1,7 @@
+# UniWAM local artifacts (baseline ec8c70f shipped no .gitignore)
+starVLA.egg-info/
+__pycache__/
+*.pyc
+wandb/
+results/
+logs/

@@ -1,5 +1,5 @@
-run_id: robot_ft
-run_root_dir: checkpoints
+run_id: i1_s3_small_ft
+run_root_dir: /vepfs/wangshilong/runs/dynaweave
 seed: 42
 trackers:
 - json
@@ -7,7 +7,7 @@ is_debug: false
 framework:
   name: VLA_JEPA
   qwenvl:
-    base_vlm: /home/dataset-local/models/Qwen3-VL-2B-Instruct
+    base_vlm: /vepfs/wangshilong/models/dynaweave/Qwen3-VL-2B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
   action_model:
@@ -38,7 +38,7 @@ framework:
       output_dim: 1024
       positional_embeddings: null
   vj2_model:
-    base_encoder: /home/dataset-local/models/vjepa2-vitl-fpc64-256
+    base_encoder: /vepfs/wangshilong/models/dynaweave/vjepa2-vitl-fpc64-256
     depth: 12
     num_heads: 8
     special_action_token: <|action_{}|>
@@ -52,7 +52,7 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /home/dataset-local/datasets/LeRobot/LEROBOT_LIBERO_DATA
+    data_root_dir: /vepfs/wangshilong/data/dynaweave/LEROBOT_LIBERO_DATA
     data_mix: libero_all
     action_type: delta_qpos
     CoT_prompt: "Your task is {instruction}. Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
@@ -66,10 +66,10 @@ datasets:
 
 trainer:
   epochs: 100
-  max_train_steps: 30000
+  max_train_steps: 200            # I1-S3 small fine-tune; upstream default 30000
   num_warmup_steps: 5000
   #num_warmup_steps: 0
-  save_interval: 10000
+  save_interval: 200               # one checkpoint at the end of the short run
   eval_interval: 100
   learning_rate:
     base: 3.0e-05
@@ -88,7 +88,7 @@ trainer:
   logging_frequency: 10
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
-  #pretrained_checkpoint: the oath of pretrained checkpoint.
+  pretrained_checkpoint: /vepfs/wangshilong/models/dynaweave/VLA-JEPA/Pretrain/checkpoints/VLA-JEPA-pretrain.pt   # published LIBERO recipe starts here
 
   optimizer:
     name: AdamW

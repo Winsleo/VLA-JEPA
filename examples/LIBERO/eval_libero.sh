@@ -1,21 +1,21 @@
 #!/bin/bash
 
 export PYTHONDONTWRITEBYTECODE=1
-export LIBERO_HOME=/home/dataset-local/LIBERO # your LIBERO code path
+export LIBERO_HOME=/vepfs/wangshilong/benchmarks/LIBERO # your LIBERO code path
 export LIBERO_CONFIG_PATH=${LIBERO_HOME}/libero
 
 export PYTHONPATH=$PYTHONPATH:${LIBERO_HOME} # let eval_libero find the LIBERO tools
 export PYTHONPATH=$(pwd):${PYTHONPATH} # let LIBERO find the websocket tools from main repo
-export sim_python=/home/dataset-local/LIBERO/env/bin/python # your LIBERO conda path
+export sim_python=/vepfs/wangshilong/envs/libero_py310/bin/python # your LIBERO conda path
 
-your_ckpt=/home/dataset-local/ginwind/huggingface/VLA-JEPA/LIBERO/checkpoints/VLA-JEPA-LIBERO.pt
+your_ckpt=/vepfs/wangshilong/models/dynaweave/VLA-JEPA/LIBERO/checkpoints/VLA-JEPA-LIBERO.pt
 folder_name=$(echo "$your_ckpt" | awk -F'/' '{print $(NF-2)"_"$(NF-1)"_"$NF}')
 
 items=("libero_10" "libero_goal" "libero_object" "libero_spatial")
 host="127.0.0.1"
 base_port=15083
 unnorm_key="franka"
-index=0
+index=3 # GPUs 0-3 are occupied by another job; README allows adapting the parallelization
 num_trials_per_task=50
 with_state="true"
 

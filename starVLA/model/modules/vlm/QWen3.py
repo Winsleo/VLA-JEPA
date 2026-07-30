@@ -55,9 +55,14 @@ class _QWen3_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
 
+        # `framework.qwenvl.attn_implementation` exists in the published configs but was ignored here.
+        # Default keeps upstream behavior; environments without flash-attn 2 (no nvcc) must set "sdpa"
+        # in their own config, not rely on a changed default.
+        attn_implementation = qwenvl_config.get("attn_implementation", "flash_attention_2")
+
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_id,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
             device_map="cuda",
         )

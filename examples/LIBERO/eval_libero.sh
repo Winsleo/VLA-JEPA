@@ -18,6 +18,9 @@ unnorm_key="franka"
 index=3 # GPUs 0-3 are occupied by another job; README allows adapting the parallelization
 num_trials_per_task=50
 with_state="true"
+# I1-S4: eval seed is overridable so the same checkpoint can be measured across seeds.
+# Default 7 keeps the client's own default, i.e. unchanged behaviour.
+seed=${SEED:-7}
 
 # start each task suite on specific GPU.
 for task_suite_name in "${items[@]}"
@@ -31,7 +34,7 @@ do
         --use_bf16 \
         --cuda ${index} &
 
-    video_out_path="results/${task_suite_name}/${folder_name}"
+    video_out_path="results/${task_suite_name}/${folder_name}_seed${seed}"
 
     LOG_DIR="logs/$(date +"%Y%m%d_%H%M%S")"
     mkdir -p ${LOG_DIR}
@@ -47,5 +50,6 @@ do
         --args.task-suite-name "$task_suite_name" \
         --args.num-trials-per-task "$num_trials_per_task" \
         --args.video-out-path "$video_out_path" > "${video_out_path}/eval.log" \
-        --args.with_state "$with_state" &
+        --args.with_state "$with_state" \
+        --args.seed "$seed" &
 done

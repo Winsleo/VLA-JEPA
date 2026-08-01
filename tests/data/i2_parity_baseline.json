@@ -1,0 +1,152 @@
+{
+  "env": {
+    "cuda": "12.4",
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "torch": "2.6.0+cu124"
+  },
+  "forward": {
+    "1": {
+      "action_loss": "0x1.cb7e100000000p+0",
+      "wm_loss": "0x1.558fd40000000p-3"
+    },
+    "999": {
+      "action_loss": "0x1.cb7e100000000p+0",
+      "wm_loss": "0x1.5423ae0000000p-3"
+    }
+  },
+  "geometry": {
+    "encoder": {
+      "grid": [
+        16,
+        16
+      ],
+      "hidden_size": 1024,
+      "image_size": 256,
+      "num_temporal_blocks": 4,
+      "patch_size": 16,
+      "tokens_per_block": 256,
+      "tubelet_size": 2
+    },
+    "predictor": {
+      "attn_mask_shape": [
+        1056,
+        1056
+      ],
+      "grid": [
+        16,
+        16
+      ],
+      "num_frames": 4,
+      "tubelet_size": 1
+    }
+  },
+  "param_groups": {
+    "groups": [
+      {
+        "lr": "0x1.4f8b588e368f1p-17",
+        "name": "qwen_vl_interface",
+        "num_tensors": 625,
+        "numel": 2127532032
+      },
+      {
+        "lr": "0x1.a36e2eb1c432dp-14",
+        "name": "action_model",
+        "num_tensors": 248,
+        "numel": 155182343
+      },
+      {
+        "lr": "0x1.f75104d551d69p-16",
+        "name": "base",
+        "num_tensors": 743,
+        "numel": 487618944
+      }
+    ]
+  },
+  "parameters": {
+    "num_parameters": 2770333319,
+    "num_teacher_trainable_parameters": 325971328,
+    "num_trainable_parameters": 2770333319,
+    "state_dict_keys_sha256": "8b316ae064eea038ed4f33d2ffe7b46e8c633fe72e74368650e497bad51eb1a2",
+    "state_dict_num_keys": 1617,
+    "teacher_num_parameters": 325971328,
+    "trainable_keys_sha256": "569c9b28c3dbf2ad601bc13619b278fe165f9f0c24ce1cdeed3f53d3a1f04455"
+  },
+  "predict_action": {
+    "dtype": "float32",
+    "sha256": "ddba91185fcb5874be0ab8fe8d6f707bcc46135091e4e55ca341ceb698557b33",
+    "shape": [
+      2,
+      7,
+      7
+    ]
+  },
+  "short_run": {
+    "last_lr": [
+      "0x1.5798ee2308c3ap-27",
+      "0x1.ad7f29abcaf49p-24",
+      "0x1.01b2b29a4692cp-25"
+    ],
+    "modules": {
+      "action_model": {
+        "num_params": 155182343,
+        "param_abs_sum": "0x1.b42ae2c2f7600p+14",
+        "param_sum": "-0x1.ce9fea598784cp+11"
+      },
+      "qwen_vl_interface": {
+        "num_params": 2127532032,
+        "param_abs_sum": "0x1.68dec6c2f077ap+19",
+        "param_sum": "0x1.58df217db5940p+18"
+      },
+      "vj_encoder": {
+        "num_params": 325971328,
+        "param_abs_sum": "0x1.b7da028d8cd34p+17",
+        "param_sum": "-0x1.2c45730fbe4b0p+16"
+      },
+      "vj_predictor": {
+        "num_params": 161647616,
+        "param_abs_sum": "0x1.f37cf26bf78a6p+16",
+        "param_sum": "0x1.8955064d0953fp+14"
+      }
+    },
+    "optimizer_steps": 5,
+    "scheduler_last_epoch": 5,
+    "step_losses": [
+      {
+        "losses": {
+          "action_loss": "0x1.c8e5c00000000p+0",
+          "wm_loss": "0x1.558fd40000000p-3"
+        },
+        "total": "0x1.f397ba0000000p+0"
+      },
+      {
+        "losses": {
+          "action_loss": "0x1.914e380000000p+1",
+          "wm_loss": "0x1.558fd40000000p-3"
+        },
+        "total": "0x1.a6a7360000000p+1"
+      },
+      {
+        "losses": {
+          "action_loss": "0x1.5045780000000p+1",
+          "wm_loss": "0x1.5590d00000000p-3"
+        },
+        "total": "0x1.659e840000000p+1"
+      },
+      {
+        "losses": {
+          "action_loss": "0x1.1ec6cc0000000p+0",
+          "wm_loss": "0x1.5590da0000000p-3"
+        },
+        "total": "0x1.4978e80000000p+0"
+      },
+      {
+        "losses": {
+          "action_loss": "0x1.ac7e020000000p+0",
+          "wm_loss": "0x1.558f340000000p-3"
+        },
+        "total": "0x1.d72fe80000000p+0"
+      }
+    ],
+    "steps": 5
+  }
+}

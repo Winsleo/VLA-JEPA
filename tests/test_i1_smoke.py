@@ -21,15 +21,16 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
-from PIL import Image
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "i1_libero_local.yaml"
-
-# Batch geometry. Values follow the published LIBERO config; asserted against it below so a
-# config change cannot silently invalidate the fixtures.
-BATCH_SIZE = 2
-NUM_VIEWS = 2
-SEED = 1234
+from parity_probe import (
+    BATCH_SIZE,
+    CONFIG_PATH,
+    NUM_VIEWS,
+    PUBLISHED_LIBERO_CKPT,
+    SEED,
+    make_examples,
+    seeded_forward,
+)
 
 
 def _require_gpu_and_weights(cfg):
@@ -54,45 +55,6 @@ def model(cfg):
     model = VLA_JEPA(cfg).to("cuda")
     model.eval()
     return model
-
-
-def _make_examples(cfg, video_seed: int, batch_size: int = BATCH_SIZE):
-    """Synthetic batch matching the dataloader contract of VLA_JEPA.forward().
-
-    image  : list[PIL.Image]                       per view, obs resolution
-    video  : np.ndarray [V, T, H, W, 3] uint8      per view clip, video resolution
-    action : np.ndarray [T_chunk, action_dim]
-    state  : np.ndarray [1, state_dim]
-    """
-    obs = cfg.datasets.vla_data.resolution_size
-    vid = cfg.datasets.vla_data.video_resolution_size
-    frames = cfg.framework.vj2_model.num_frames
-    action_dim = cfg.framework.action_model.action_dim
-    state_dim = cfg.framework.action_model.state_dim
-    chunk = cfg.framework.action_model.future_action_window_size + 1
-
-    img_rng = np.random.default_rng(SEED)
-    vid_rng = np.random.default_rng(video_seed)
-    examples = []
-    for _ in range(batch_size):
-        image = Image.fromarray(img_rng.integers(0, 255, (obs, obs, 3), dtype=np.uint8))
-        examples.append(
-            {
-                "image": [image] * NUM_VIEWS,
-                "video": vid_rng.integers(0, 255, (NUM_VIEWS, frames, vid, vid, 3), dtype=np.uint8),
-                "lang": "pick up the black bowl and place it on the plate",
-                "action": img_rng.uniform(-1, 1, size=(chunk, action_dim)).astype(np.float32),
-                "state": img_rng.uniform(-1, 1, size=(1, state_dim)).astype(np.float32),
-            }
-        )
-    return examples
-
-
-def _forward(model, examples, seed: int = SEED):
-    """Seeded forward. The flow-matching head samples noise, so the seed is part of the contract."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    return model(examples)
 
 
 # --------------------------------------------------------------------------------------
@@ -122,7 +84,7 @@ def test_world_path_shapes(model, cfg):
     """Record the real world-model shapes (implementation-plan §4 is a reference, not a fact)."""
     frames = cfg.framework.vj2_model.num_frames
     vid = cfg.datasets.vla_data.video_resolution_size
-    examples = _make_examples(cfg, video_seed=1)
+    examples = make_examples(cfg, video_seed=1)
 
     videos = np.stack([e["video"] for e in examples]).transpose(0, 1, 2, 5, 3, 4)
     b, v, t, c, h, w = videos.shape
@@ -164,7 +126,7 @@ def test_world_path_shapes(model, cfg):
 
 
 def test_forward_losses_are_named_and_finite(model, cfg):
-    out = _forward(model, _make_examples(cfg, video_seed=1))
+    out = seeded_forward(model, make_examples(cfg, video_seed=1))
     assert set(out) == {"action_loss", "wm_loss"}
     for name, value in out.items():
         assert value.ndim == 0
@@ -186,11 +148,11 @@ def test_action_free_batch_masks_only_action_loss(model, cfg):
     video_cot = "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
     OmegaConf.update(cfg, "datasets.video_data", {"CoT_prompt": video_cot}, force_add=True)
     try:
-        examples = _make_examples(cfg, video_seed=1)
+        examples = make_examples(cfg, video_seed=1)
         for e in examples:
             e.pop("action")
             e.pop("state")
-        out = _forward(model, examples)
+        out = seeded_forward(model, examples)
     finally:
         del cfg.datasets["video_data"]
 
@@ -203,9 +165,9 @@ def test_action_free_batch_masks_only_action_loss(model, cfg):
 # --------------------------------------------------------------------------------------
 
 def test_forward_is_deterministic_under_seed(model, cfg):
-    examples = _make_examples(cfg, video_seed=1)
-    first = _forward(model, examples)
-    second = _forward(model, examples)
+    examples = make_examples(cfg, video_seed=1)
+    first = seeded_forward(model, examples)
+    second = seeded_forward(model, examples)
     for name in first:
         assert torch.equal(first[name], second[name]), (
             f"{name} not bit-wise reproducible: {first[name].item()} vs {second[name].item()}"
@@ -221,8 +183,8 @@ def test_future_substitution_does_not_move_action_loss(model, cfg):
 
     implementation-plan §10 future-substitution invariant.
     """
-    a = _forward(model, _make_examples(cfg, video_seed=1))
-    b = _forward(model, _make_examples(cfg, video_seed=999))
+    a = seeded_forward(model, make_examples(cfg, video_seed=1))
+    b = seeded_forward(model, make_examples(cfg, video_seed=999))
     assert torch.equal(a["action_loss"], b["action_loss"]), (
         f"action loss leaked future frames: {a['action_loss'].item()} vs {b['action_loss'].item()}"
     )
@@ -231,7 +193,7 @@ def test_future_substitution_does_not_move_action_loss(model, cfg):
 
 def test_fast_policy_graph_excludes_world_modules(model, cfg):
     """predict_action must not touch the V-JEPA encoder or the world predictor (I1 gate)."""
-    examples = _make_examples(cfg, video_seed=1)
+    examples = make_examples(cfg, video_seed=1)
 
     calls = []
 
@@ -272,13 +234,10 @@ def test_published_libero_checkpoint_loads_strict(model, cfg):
     loads with strict=True (trainer_tools.load_pretrained_backbones), so any key or shape drift
     would surface here instead of during S2 evaluation.
     """
-    ckpt_path = Path(
-        "/vepfs/wangshilong/models/dynaweave/VLA-JEPA/LIBERO/checkpoints/VLA-JEPA-LIBERO.pt"
-    )
-    if not ckpt_path.exists():
-        pytest.skip(f"missing published checkpoint: {ckpt_path}")
+    if not PUBLISHED_LIBERO_CKPT.exists():
+        pytest.skip(f"missing published checkpoint: {PUBLISHED_LIBERO_CKPT}")
 
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    checkpoint = torch.load(PUBLISHED_LIBERO_CKPT, map_location="cpu")
     state = model.state_dict()
     missing = sorted(set(state) - set(checkpoint))
     unexpected = sorted(set(checkpoint) - set(state))
@@ -301,7 +260,7 @@ def test_published_libero_checkpoint_loads_strict(model, cfg):
 def test_target_encoder_receives_no_gradient(model, cfg):
     """The no_grad() around the teacher forward is the one firewall rule the baseline does keep."""
     model.zero_grad(set_to_none=True)
-    out = _forward(model, _make_examples(cfg, video_seed=1))
+    out = seeded_forward(model, make_examples(cfg, video_seed=1))
     (out["wm_loss"] + out["action_loss"]).backward()
     grads = [n for n, p in model.vj_encoder.named_parameters() if p.grad is not None]
     assert grads == [], f"gradient reached the frozen teacher: {grads[:5]}"

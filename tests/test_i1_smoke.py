@@ -140,24 +140,16 @@ def test_forward_losses_are_named_and_finite(model, cfg):
 def test_action_free_batch_masks_only_action_loss(model, cfg):
     """AGENTS §7 / D-012: an action-free sample must drop the action loss, not zero-pad actions.
 
-    Baseline characteristic: the action-free branch of VLA_JEPA.forward() reads
-    `datasets.video_data.CoT_prompt`, a key that only exists in the cotrain config. A robot-only
-    config (LIBERO) therefore raises ConfigAttributeError on action-free samples. The prompt
-    injected below is the upstream cotrain value (scripts/config/vlajepa_cotrain.yaml:70), so this
-    test exercises the real routing instead of an invented one.
+    Run under the robot-only LIBERO config, i.e. without `datasets.video_data`. I1 needed that node
+    injected because the action-free branch read it unconditionally; I2 C5 selects the prompt with a
+    default, so this is now the real routing rather than a fixture-only one.
     """
-    from omegaconf import OmegaConf
-
-    video_cot = "Your task is {instruction}. Infer the temporal dynamics of future frames {actions}."
-    OmegaConf.update(cfg, "datasets.video_data", {"CoT_prompt": video_cot}, force_add=True)
-    try:
-        examples = make_examples(cfg, video_seed=1)
-        for e in examples:
-            e.pop("action")
-            e.pop("state")
-        out = seeded_forward(model, examples)
-    finally:
-        del cfg.datasets["video_data"]
+    assert "video_data" not in cfg.datasets, "fixture no longer exercises the robot-only config"
+    examples = make_examples(cfg, video_seed=1)
+    for e in examples:
+        e.pop("action")
+        e.pop("state")
+    out = seeded_forward(model, examples)
 
     losses, _ = split_losses(out)
     assert set(losses) == {"wm_loss"}

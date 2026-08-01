@@ -17,16 +17,11 @@ import tyro
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-from examples.LIBERO.model2libero_interface import M1Inference
+from examples.LIBERO.model2libero_interface import M1Inference, libero_gripper_command
 
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
-def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
-    arr = np.asarray(open_val, dtype=np.float32).reshape(-1)
-    v = float(arr[0])
-    bin_val = 1.0 - 2.0 * (v > 0.5)
-    return np.asarray([bin_val], dtype=np.float32)
 
 import hashlib
 
@@ -207,7 +202,7 @@ def eval_libero(args: Args) -> None:
                 world_vector_delta = np.asarray(raw_action.get("world_vector"), dtype=np.float32).reshape(-1)
                 rotation_delta = np.asarray(raw_action.get("rotation_delta"), dtype=np.float32).reshape(-1)
                 open_gripper = np.asarray(raw_action.get("open_gripper"), dtype=np.float32).reshape(-1)
-                gripper = _binarize_gripper_open(open_gripper)
+                gripper = libero_gripper_command(open_gripper)
 
                 if not (world_vector_delta.size == 3 and rotation_delta.size == 3 and open_gripper.size == 1):
                     logging.warning(f"Unexpected action sizes: "

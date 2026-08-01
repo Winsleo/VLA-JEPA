@@ -2,7 +2,11 @@ from pathlib import Path
 from typing import Sequence
 from omegaconf import OmegaConf
 
-from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
+from starVLA.dataloader.gr00t_lerobot.datasets import (
+    DEFAULT_PADDING_STRATEGY,
+    LeRobotSingleDataset,
+    LeRobotMixtureDataset,
+)
 from starVLA.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 from starVLA.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.embodiment_tags import ROBOT_TYPE_TO_EMBODIMENT_TAG, EmbodimentTag
@@ -17,6 +21,7 @@ def make_LeRobotSingleDataset(
     delete_pause_frame: bool = False,
     action_horizon: int = 7,
     video_horizon: int = 16,
+    padding_strategy: str = DEFAULT_PADDING_STRATEGY,
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -47,6 +52,7 @@ def make_LeRobotSingleDataset(
         embodiment_tag=embodiment_tag,
         video_backend="torchvision_av",
         delete_pause_frame=delete_pause_frame,
+        padding_strategy=padding_strategy,
     )
 
 def get_vla_dataset(
@@ -83,7 +89,10 @@ def get_vla_dataset(
                                                           robot_type, 
                                                           delete_pause_frame=delete_pause_frame, 
                                                           action_horizon=action_horizon,
-                                                          video_horizon=video_horizon), d_weight))
+                                                          video_horizon=video_horizon,
+                                                          padding_strategy=data_cfg.get(
+                                                              "padding_strategy", DEFAULT_PADDING_STRATEGY)),
+                                d_weight))
 
     return LeRobotMixtureDataset(
         dataset_mixture,

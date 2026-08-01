@@ -14,6 +14,39 @@ from pathlib import Path
 
 from starVLA.model.tools import read_mode_config
 
+# Gripper channel of the 7-DoF LIBERO action, and the three-stage round trip it goes through.
+# 1. The policy emits a continuous value in [-1, 1]; it is snapped to the two states the training
+#    data contains, because everything downstream treats the gripper as binary.
+# 2. Unnormalisation with the LIBERO action stats maps those to 0.5 (close) and 1.0 (open), so the
+#    threshold below is on the *unnormalised* scale and `>` keeps 0.5 on the close side.
+# 3. LIBERO's own gripper channel is inverted with respect to "open": +1 closes, -1 opens
+#    (LIBERO_DUMMY_ACTION in eval_libero.py ends in -1.0, i.e. an open gripper).
+# The values are the pinned upstream ones; only the names are new (D-040).
+GRIPPER_INDEX = 6
+GRIPPER_NORMALIZED_THRESHOLD = 0.5
+GRIPPER_NORMALIZED_CLOSE = 0.0
+GRIPPER_NORMALIZED_OPEN = 1.0
+GRIPPER_UNNORMALIZED_THRESHOLD = 0.5
+LIBERO_GRIPPER_CLOSE = 1.0
+LIBERO_GRIPPER_OPEN = -1.0
+
+
+def libero_gripper_command(open_gripper) -> np.ndarray:
+    """Convert an unnormalised `open_gripper` value into LIBERO's gripper action.
+
+    Lives here rather than in eval_libero.py so it is importable without the LIBERO simulator, and
+    next to the thresholding that produces its input.
+
+    Args:
+        open_gripper: unnormalised gripper value, 0.5 (close) or 1.0 (open) after the round trip.
+
+    Returns:
+        float32 array of shape (1,): LIBERO_GRIPPER_OPEN or LIBERO_GRIPPER_CLOSE.
+    """
+    value = float(np.asarray(open_gripper, dtype=np.float32).reshape(-1)[0])
+    is_open = value > GRIPPER_UNNORMALIZED_THRESHOLD
+    return np.asarray([LIBERO_GRIPPER_OPEN if is_open else LIBERO_GRIPPER_CLOSE], dtype=np.float32)
+
 
 class M1Inference:
     def __init__(
@@ -137,7 +170,11 @@ class M1Inference:
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["min"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["max"]), np.array(action_norm_stats["min"])
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        normalized_actions[:, GRIPPER_INDEX] = np.where(
+            normalized_actions[:, GRIPPER_INDEX] < GRIPPER_NORMALIZED_THRESHOLD,
+            GRIPPER_NORMALIZED_CLOSE,
+            GRIPPER_NORMALIZED_OPEN,
+        )
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,

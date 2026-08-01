@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from transformers import AutoVideoProcessor, AutoModel, AutoTokenizer, VJEPA2VideoProcessor
+from omegaconf import OmegaConf
 
 from starVLA.training.trainer_utils import initialize_overwatch
 
@@ -214,7 +215,10 @@ class VLA_JEPA(baseframework):
                 images=batch_images, 
                 instructions=instructions,
                 prompt_replace_dict={"{actions}":self.replace_prompt},
-                prompt_template=self.config.datasets.video_data.get("CoT_prompt", ""))
+                # `datasets.video_data` only exists in the cotrain configs, while an action-free
+                # sample can reach this branch under any config; select() returns the same prompt
+                # where the node exists and "" instead of raising where it does not.
+                prompt_template=OmegaConf.select(self.config, "datasets.video_data.CoT_prompt", default=""))
         
         action_indices = torch.isin(qwen_inputs['input_ids'], torch.tensor(self.action_token_ids, device=qwen_inputs['input_ids'].device))
         action_indices = action_indices.nonzero(as_tuple=True)

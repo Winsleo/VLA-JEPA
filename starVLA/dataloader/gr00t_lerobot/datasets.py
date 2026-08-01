@@ -102,6 +102,13 @@ def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     return dataset_statistics
 
 
+# Padding of state/action windows that cross an episode boundary. "first_last" repeats the episode's
+# first/last step, "zero" writes zeros. Upstream hard-coded "zero" at the call site in
+# get_data_by_modality; DEFAULT_PADDING_STRATEGY keeps that behaviour when no config sets one.
+PADDING_STRATEGIES = ("first_last", "zero")
+DEFAULT_PADDING_STRATEGY = "zero"
+
+
 class ModalityConfig(BaseModel):
     """Configuration for a modality."""
 
@@ -124,6 +131,7 @@ class LeRobotSingleDataset(Dataset):
         video_backend_kwargs: dict | None = None,
         transforms: ComposedModalityTransform | None = None,
         delete_pause_frame: bool = False,
+        padding_strategy: str = DEFAULT_PADDING_STRATEGY,
     ):
         """
         Initialize the dataset.
@@ -136,12 +144,18 @@ class LeRobotSingleDataset(Dataset):
             video_backend_kwargs (dict): Keyword arguments for the video backend when initializing the video reader.
             transforms (ComposedModalityTransform): The transforms to apply to the dataset.
             embodiment_tag (EmbodimentTag): Overload the embodiment tag for the dataset. e.g. define it as "new_embodiment"
+            padding_strategy (str): How state/action windows that run past an episode boundary are
+                padded, one of PADDING_STRATEGIES. Defaults to the value the pinned upstream
+                hard-coded, so the data is unchanged unless a config asks for another strategy.
         """
         # first check if the path directory exists
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
 
         self.delete_pause_frame = delete_pause_frame
+        if padding_strategy not in PADDING_STRATEGIES:
+            raise ValueError(f"Invalid padding strategy: {padding_strategy}, expected one of {PADDING_STRATEGIES}")
+        self.padding_strategy = padding_strategy
 
         self.modality_configs = modality_configs
         self.video_backend = video_backend
@@ -976,8 +990,11 @@ class LeRobotSingleDataset(Dataset):
             array=data_array,
             step_indices=step_indices,
             max_length=max_length,
-            # padding_strategy="first_last" if state_or_action_cfg.absolute else "zero",
-            padding_strategy="zero",           # HACK for realdata
+            # Upstream hard-coded "zero" here, overriding the commented-out rule above with a note
+            # reading "HACK for realdata"; it is now the configurable default so the choice is
+            # visible in the run config. Switching it changes the training data, so a different
+            # value belongs to its own experiment ID (D-040).
+            padding_strategy=self.padding_strategy,
         )
 
     def get_language(

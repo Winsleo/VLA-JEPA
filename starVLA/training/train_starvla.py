@@ -43,6 +43,10 @@ from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+from starVLA.training.trainer_utils.trainer_tools import METRIC_PREFIX
+from starVLA.training.trainer_utils.trainer_tools import frozen_module_has_no_gradient
+from starVLA.training.trainer_utils.trainer_tools import global_grad_norm
+from starVLA.training.trainer_utils.trainer_tools import module_grad_norms
 from starVLA.training.trainer_utils.trainer_tools import split_loss_terms
 
 deepspeed_plugin = DeepSpeedPlugin()
@@ -59,6 +63,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from accelerate.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# Submodules whose gradient norm is reported on logging steps. The V-JEPA teacher is deliberately
+# absent: it is frozen, and _gradient_metrics checks that it stays that way instead of logging it.
+GRAD_NORM_MODULES = ("qwen_vl_interface", "action_model", "vj_predictor")
 
 
 def load_fast_tokenizer():
@@ -489,16 +498,46 @@ class VLATrainer(TrainerUtils):
             self.accelerator.backward(total_loss)
 
             # gradient clipping
+            clip_result = None
             if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                clip_result = self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), self.config.trainer.gradient_clipping
+                )
+
+            # gradient diagnostics, while the gradients still exist. Read-only, and only on logging
+            # steps: walking every parameter each step would be a measurable cost.
+            grad_metrics = self._gradient_metrics(clip_result) if self._is_logging_step() else {}
 
             # optimizer step
             self.optimizer.step()
             self.lr_scheduler.step()
-            
+
             result_dict = {k: v.item() for k, v in output_dict.items()}
+            result_dict.update(grad_metrics)
 
         return result_dict
+
+    def _is_logging_step(self):
+        """Cadence of _log_metrics, evaluated before the loop increments completed_steps."""
+        return (
+            self.accelerator.sync_gradients
+            and (self.completed_steps + 1) % self.config.trainer.logging_frequency == 0
+        )
+
+    def _gradient_metrics(self, clip_result):
+        """Total and per-module gradient norms, plus the frozen-teacher firewall check."""
+        metrics = {}
+        total = global_grad_norm(self.accelerator, clip_result)
+        if total is not None:
+            metrics[f"{METRIC_PREFIX}grad_norm/total"] = total
+
+        model = self.accelerator.unwrap_model(self.model)
+        metrics.update(module_grad_norms(model, GRAD_NORM_MODULES))
+
+        teacher = getattr(model, "vj_encoder", None)
+        if teacher is not None and not frozen_module_has_no_gradient(teacher):
+            raise RuntimeError("gradient firewall: the frozen V-JEPA teacher received a gradient")
+        return metrics
 
     def _finalize_training(self):
         """training end processing"""

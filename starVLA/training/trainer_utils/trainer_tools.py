@@ -42,6 +42,74 @@ def split_loss_terms(output_dict):
     return losses, metrics
 
 
+# Prefixes that DDP, DeepSpeed and torch.compile add in front of a parameter's module path.
+_WRAPPER_PREFIXES = ("module.", "_orig_mod.")
+
+
+def _unwrap_param_name(name):
+    """Strip wrapper prefixes so a plain module path such as `action_model` still matches."""
+    while True:
+        for prefix in _WRAPPER_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+                break
+        else:
+            return name
+
+
+def module_grad_norms(model, prefixes):
+    """Per-module gradient L2 norm, log-only (AGENTS.md section 10 step 8).
+
+    Meant for logging steps: it walks every parameter, so it is not free. Parameters whose gradient
+    is None are skipped, which under ZeRO gradient partitioning means the norm covers the shard
+    this rank owns; the reported tensor count makes that visible instead of silently reading as a
+    smaller norm.
+
+    Args:
+        model: unwrapped model; `prefixes` are matched against its module paths.
+        prefixes: module paths to report, e.g. ("qwen_vl_interface", "action_model").
+
+    Returns:
+        dict of METRIC_PREFIX-keyed floats: one norm and one tensor count per prefix.
+    """
+    squares = {prefix: 0.0 for prefix in prefixes}
+    counts = {prefix: 0 for prefix in prefixes}
+    for raw_name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        name = _unwrap_param_name(raw_name)
+        for prefix in prefixes:
+            if name == prefix or name.startswith(f"{prefix}."):
+                squares[prefix] += param.grad.detach().float().norm(2).item() ** 2
+                counts[prefix] += 1
+                break
+
+    metrics = {}
+    for prefix in prefixes:
+        metrics[f"{METRIC_PREFIX}grad_norm/{prefix}"] = squares[prefix] ** 0.5
+        metrics[f"{METRIC_PREFIX}grad_tensors/{prefix}"] = float(counts[prefix])
+    return metrics
+
+
+def global_grad_norm(accelerator, clip_result=None):
+    """Total gradient norm for logging, whichever backend computed it.
+
+    `Accelerator.clip_grad_norm_` returns the norm on DDP/FSDP but None under DeepSpeed, which
+    clips inside its own engine; the engine's global norm is read in that case. Returns None when
+    no backend exposes one, so the caller logs nothing rather than a wrong zero.
+    """
+    if clip_result is not None:
+        return float(clip_result)
+    engine = getattr(getattr(accelerator, "deepspeed_engine_wrapped", None), "engine", None)
+    norm = engine.get_global_grad_norm() if engine is not None else None
+    return None if norm is None else float(norm)
+
+
+def frozen_module_has_no_gradient(module):
+    """Gradient firewall check (AGENTS.md section 6): nothing here may receive or hold a gradient."""
+    return all(not param.requires_grad and param.grad is None for param in module.parameters())
+
+
 # === Define Tracker Interface ===
 #
 

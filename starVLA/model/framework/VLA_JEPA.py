@@ -29,7 +29,7 @@ from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.model.modules.world_model.vj_backbone_adapter import VJBackboneAdapter
-from starVLA.training.trainer_utils.trainer_tools import resize_images
+from starVLA.training.trainer_utils.trainer_tools import METRIC_PREFIX, resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
 @FRAMEWORK_REGISTRY.register("VLA_JEPA")
@@ -111,6 +111,14 @@ class VLA_JEPA(baseframework):
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
+
+        # World-model loss weights. The two defaults reproduce the pinned baseline, which weights
+        # the world loss differently depending on the sample type: 0.1 next to an action loss, and
+        # 1.0 for action-free samples, where it is the only loss. The asymmetry is upstream
+        # behaviour, kept on purpose; changing it is a separate experiment.
+        loss_scale = self.config.trainer.get("loss_scale", {}) if self.config and self.config.trainer else {}
+        self.wm_loss_weight = loss_scale.get("wm", 0.1)
+        self.wm_action_free_loss_weight = loss_scale.get("wm_action_free", 1.0)
 
     def train(self, mode: bool = True):
         """Keep the frozen teacher in eval mode when the parent switches to train (AGENTS.md 6)."""
@@ -250,7 +258,11 @@ class VLA_JEPA(baseframework):
             )
         
         if "action" not in examples[0]:
-            return {"wm_loss": teacher_forcing_wm_loss}
+            weight = self.wm_action_free_loss_weight
+            return {
+                "wm_loss": teacher_forcing_wm_loss * weight,
+                **self._loss_metrics(teacher_forcing_wm_loss, weight),
+            }
 
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
@@ -260,6 +272,11 @@ class VLA_JEPA(baseframework):
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
+            # Read from `trainer`, while every config declares the value under
+            # `framework.action_model`, so the literal default is what actually applies. Kept as is
+            # on purpose: correcting the node would change the effective batch repeat, i.e. break
+            # I2 parity. Locked at 4 and scheduled for I4.5 (D-041); pinned by
+            # tests/test_i2_parity.py::test_repeated_diffusion_steps_effective_value_is_pinned.
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
             )
@@ -278,7 +295,28 @@ class VLA_JEPA(baseframework):
             #exit()
             action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
 
-        return {"action_loss": action_loss, "wm_loss": teacher_forcing_wm_loss * 0.1}
+        weight = self.wm_loss_weight
+        return {
+            "action_loss": action_loss,
+            "wm_loss": teacher_forcing_wm_loss * weight,
+            **self._loss_metrics(teacher_forcing_wm_loss, weight, action_loss=action_loss),
+        }
+
+    def _loss_metrics(self, wm_loss, wm_weight, action_loss=None):
+        """Log-only companions of the returned losses (AGENTS.md section 10, item 8).
+
+        Keys carry METRIC_PREFIX, which trainer_tools.split_loss_terms excludes from the backward
+        sum, so reporting raw values alongside the weighted ones cannot change optimization.
+        """
+        metrics = {
+            f"{METRIC_PREFIX}wm_loss_raw": wm_loss.detach(),
+            f"{METRIC_PREFIX}wm_loss_weight": torch.as_tensor(
+                wm_weight, device=wm_loss.device, dtype=torch.float32
+            ),
+        }
+        if action_loss is not None:
+            metrics[f"{METRIC_PREFIX}action_loss_raw"] = action_loss.detach()
+        return metrics
 
     @torch.inference_mode()
     def predict_action(

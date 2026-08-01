@@ -204,6 +204,27 @@ def probe_forward(model, cfg) -> dict:
     return out
 
 
+def probe_loss_split(model, cfg) -> dict:
+    """How the framework output splits into optimized losses and log-only metrics (C3).
+
+    The optimized values themselves are compared by `probe_forward`; what is recorded here is the
+    partition and the raw/weight/weighted relation, so an added metric key cannot silently end up
+    in the backward sum. The equality is evaluated with torch, in whatever dtype the forward
+    produced, instead of being recomputed from the serialised hex in double precision.
+    """
+    output = seeded_forward(model, make_examples(cfg, video_seed=PROBE_VIDEO_SEEDS[0]))
+    losses, metrics = split_losses(output)
+    weighted_matches = None
+    raw, weight = metrics.get("metric/wm_loss_raw"), metrics.get("metric/wm_loss_weight")
+    if raw is not None and weight is not None:
+        weighted_matches = bool(torch.equal(losses["wm_loss"], raw * weight))
+    return {
+        "loss_names": sorted(losses),
+        "metric_names": sorted(metrics),
+        "wm_loss_equals_raw_times_weight": weighted_matches,
+    }
+
+
 def probe_predict_action(model, cfg) -> dict:
     """Fast Policy output. Must not move: I2 does not touch the action head."""
     examples = make_examples(cfg, video_seed=PROBE_VIDEO_SEEDS[0])
@@ -346,6 +367,7 @@ def collect_probe() -> dict:
     payload = {
         "env": env_fingerprint(),
         "forward": probe_forward(model, cfg),
+        "loss_split": probe_loss_split(model, cfg),
         "predict_action": probe_predict_action(model, cfg),
         "geometry": probe_geometry(model, cfg),
         "parameters": probe_parameters(model),

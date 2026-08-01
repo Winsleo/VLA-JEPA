@@ -43,6 +43,7 @@ from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
 from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+from starVLA.training.trainer_utils.trainer_tools import split_loss_terms
 
 deepspeed_plugin = DeepSpeedPlugin()
 accelerator = Accelerator(
@@ -481,7 +482,8 @@ class VLATrainer(TrainerUtils):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
 
-                total_loss = sum(output_dict.values())
+                losses, _ = split_loss_terms(output_dict)
+                total_loss = sum(losses.values())
 
             # VLA backward propagation
             self.accelerator.backward(total_loss)

@@ -16,6 +16,32 @@ from accelerate.logging import get_logger
 logger = get_logger(__name__)
 
 
+# Frameworks return their losses and their log-only diagnostics in one dict. Keys with this prefix
+# are reported but never summed into the backward pass; see split_loss_terms below.
+METRIC_PREFIX = "metric/"
+
+
+def split_loss_terms(output_dict):
+    """Split a framework output into optimized losses and log-only metrics.
+
+    AGENTS.md section 10 step 8 asks for raw and weighted losses to be logged separately, so the
+    forward output carries terms that must not be optimized. Trainers therefore sum `losses` only.
+
+    Args:
+        output_dict: mapping name -> scalar tensor, as returned by a framework's forward().
+
+    Returns:
+        (losses, metrics): the terms to sum for backward, and the METRIC_PREFIX ones to log.
+    """
+    losses, metrics = {}, {}
+    for name, value in output_dict.items():
+        if name.startswith(METRIC_PREFIX):
+            metrics[name] = value
+        else:
+            losses[name] = value
+    return losses, metrics
+
+
 # === Define Tracker Interface ===
 #
 

@@ -30,6 +30,7 @@ from parity_probe import (
     SEED,
     make_examples,
     seeded_forward,
+    split_losses,
 )
 
 
@@ -127,11 +128,13 @@ def test_world_path_shapes(model, cfg):
 
 def test_forward_losses_are_named_and_finite(model, cfg):
     out = seeded_forward(model, make_examples(cfg, video_seed=1))
-    assert set(out) == {"action_loss", "wm_loss"}
+    # I2 C3 adds log-only diagnostics to the same dict; the optimized half is what is named here.
+    losses, metrics = split_losses(out)
+    assert set(losses) == {"action_loss", "wm_loss"}
     for name, value in out.items():
         assert value.ndim == 0
         assert torch.isfinite(value), f"{name} is not finite: {value}"
-        print(f"\n[loss] {name} = {value.item():.6f}")
+        print(f"\n[{'metric' if name in metrics else 'loss'}] {name} = {value.item():.6f}")
 
 
 def test_action_free_batch_masks_only_action_loss(model, cfg):
@@ -156,7 +159,8 @@ def test_action_free_batch_masks_only_action_loss(model, cfg):
     finally:
         del cfg.datasets["video_data"]
 
-    assert set(out) == {"wm_loss"}
+    losses, _ = split_losses(out)
+    assert set(losses) == {"wm_loss"}
     assert torch.isfinite(out["wm_loss"])
 
 

@@ -40,6 +40,7 @@ from starVLA.dataloader import build_dataloader
 from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
 from starVLA.model.framework import build_framework
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
+from starVLA.training.trainer_utils.trainer_tools import split_loss_terms
 
 deepspeed_plugin = DeepSpeedPlugin()
 accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
@@ -386,7 +387,8 @@ class VLAMTrainer(TrainerUtils):
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
-                total_loss = sum(output_dict.values())
+                losses, _ = split_loss_terms(output_dict)
+                total_loss = sum(losses.values())
             
             self.accelerator.backward(total_loss)
             # gradient clipping
@@ -400,7 +402,8 @@ class VLAMTrainer(TrainerUtils):
             self.optimizer.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 vlm_output = self.model.forward(batch_vlm)
-                vlm_loss = sum(vlm_output.values())
+                vlm_losses, _ = split_loss_terms(vlm_output)
+                vlm_loss = sum(vlm_losses.values())
 
             self.accelerator.backward(vlm_loss)
             # gradient clipping
@@ -419,7 +422,8 @@ class VLAMTrainer(TrainerUtils):
             # VLM task forward propagation
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 vlm_output = self.model.forward(batch_vlm)
-                vlm_loss = sum(vlm_output.values())
+                vlm_losses, _ = split_loss_terms(vlm_output)
+                vlm_loss = sum(vlm_losses.values())
 
             self.accelerator.backward(vlm_loss)
 

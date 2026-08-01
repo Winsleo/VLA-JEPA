@@ -32,6 +32,7 @@ from omegaconf import OmegaConf
 
 from parity_probe import (
     CONFIG_PATH,
+    PROBE_VIDEO_SEEDS,
     PUBLISHED_LIBERO_CKPT,
     collect_probe,
     env_fingerprint,
@@ -108,6 +109,23 @@ def test_forward_losses_match_golden(probe, golden):
         )
         for name, expected in losses.items():
             _assert_hex_equal(f"forward[{video_seed}].{name}", probe["forward"][video_seed][name], expected)
+
+
+def test_metric_keys_stay_out_of_the_optimized_losses(probe, golden):
+    """C3 adds raw/weighted diagnostics to the forward output; they must not be optimized.
+
+    Golden is not consulted for the partition itself (it predates the metric keys). What is
+    compared against golden is the optimized set: the loss names, and via
+    `test_short_run_losses_match_golden`, the bit-wise total the trainers actually sum.
+    """
+    split = probe["loss_split"]
+    assert split["loss_names"] == sorted(golden["forward"][str(PROBE_VIDEO_SEEDS[0])])
+    assert all(name.startswith("metric/") for name in split["metric_names"]), split["metric_names"]
+    assert not set(split["loss_names"]) & set(split["metric_names"])
+    if split["metric_names"]:
+        assert split["wm_loss_equals_raw_times_weight"] is True, (
+            "logged raw loss and weight do not reproduce the optimized wm_loss"
+        )
 
 
 def test_predict_action_matches_golden(probe, golden):

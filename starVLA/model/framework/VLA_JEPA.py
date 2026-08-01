@@ -89,20 +89,25 @@ class VLA_JEPA(baseframework):
             num_frames=self.config.framework.vj2_model.num_frames,
         )
 
-        tubelet_size = self.vj_encoder.config.tubelet_size
+        # One predictor token per teacher token: the geometry comes from the backbone adapter, and
+        # `grid_size` / `num_temporal_blocks` make the predictor verify it against its own
+        # img_size/num_frames derivation instead of silently disagreeing.
         self.vj_predictor = VisionTransformerPredictorAC(
-            num_frames=self.config.framework.vj2_model.num_frames//tubelet_size,
-            img_size=((self.vj_encoder.config.image_size, self.vj_encoder.config.image_size)),
+            num_frames=self.vj_backbone.num_temporal_blocks,
+            img_size=(self.vj_backbone.image_size, self.vj_backbone.image_size),
             tubelet_size=1,
             depth=self.config.framework.vj2_model.depth,
             num_heads=self.config.framework.vj2_model.num_heads,
-            embed_dim=self.vj_encoder.config.hidden_size * 2, # multi view
+            embed_dim=self.vj_backbone.hidden_size * 2, # multi view
             action_embed_dim=self.qwen_vl_interface.model.config.hidden_size,
             num_add_tokens=self.config.framework.vj2_model.num_action_tokens_per_timestep,
+            grid_size=self.vj_backbone.grid_size,
+            num_temporal_blocks=self.vj_backbone.num_temporal_blocks,
         )
+        # One action-token group per predicted temporal block, i.e. all blocks but the first.
         self.replace_prompt = "".join(
             [each * self.config.framework.vj2_model.num_action_tokens_per_timestep for each in
-             action_tokens[:self.config.framework.vj2_model.num_frames//tubelet_size - 1]]
+             action_tokens[:self.vj_backbone.num_temporal_blocks - 1]]
         )
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])

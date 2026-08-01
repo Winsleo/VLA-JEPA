@@ -45,6 +45,8 @@ class VisionTransformerPredictorAC(nn.Module):
         use_extrinsics=False,
         # added
         num_add_tokens=8,
+        grid_size=None,
+        num_temporal_blocks=None,
         **kwargs
     ):
         super().__init__()
@@ -69,6 +71,28 @@ class VisionTransformerPredictorAC(nn.Module):
 
         self.grid_height = img_size[0] // self.patch_size
         self.grid_width = img_size[1] // self.patch_size
+        self.grid_depth = self.num_frames // self.tubelet_size
+
+        # The token layout must match the teacher that produces the input states, but it is derived
+        # here from img_size/patch_size/num_frames instead of being stated. `grid_size` and
+        # `num_temporal_blocks` let the caller pass the teacher's measured geometry so a mismatch
+        # fails at construction time rather than as a shape error deep in the attention mask. Both
+        # are optional: omitting them keeps the derived values (backwards compatible).
+        if grid_size is not None and tuple(grid_size) != (self.grid_height, self.grid_width):
+            raise ValueError(
+                f"grid_size {tuple(grid_size)} does not match the grid derived from "
+                f"img_size {img_size} and patch_size {patch_size}: ({self.grid_height}, {self.grid_width})"
+            )
+        if num_temporal_blocks is not None and num_temporal_blocks != self.grid_depth:
+            raise ValueError(
+                f"num_temporal_blocks {num_temporal_blocks} does not match the blocks derived from "
+                f"num_frames {num_frames} and tubelet_size {tubelet_size}: {self.grid_depth}"
+            )
+        # RoPE blocks below take a single scalar grid size, so a non-square grid would be applied
+        # incorrectly instead of raising.
+        if use_rope and self.grid_height != self.grid_width:
+            raise ValueError(f"use_rope requires a square grid, got ({self.grid_height}, {self.grid_width})")
+
         self.use_activation_checkpointing = use_activation_checkpointing
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
@@ -110,11 +134,8 @@ class VisionTransformerPredictorAC(nn.Module):
 
         attn_mask = None
         if self.is_frame_causal:
-            grid_depth = self.num_frames // self.tubelet_size
-            grid_height = self.img_height // self.patch_size
-            grid_width = self.img_width // self.patch_size
             attn_mask = build_action_block_causal_attention_mask(
-                grid_depth, grid_height, grid_width, add_tokens=num_add_tokens
+                self.grid_depth, self.grid_height, self.grid_width, add_tokens=num_add_tokens
             )
         self.attn_mask = attn_mask
 

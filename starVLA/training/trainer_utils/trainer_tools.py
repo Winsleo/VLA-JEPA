@@ -83,6 +83,11 @@ def build_param_lr_groups(model, cfg):
             print(f"⚠️ freeze module path does not exist: {freeze_path}")
             continue
 
+    # Modules frozen in code rather than by config (the V-JEPA teacher, see VJBackboneAdapter)
+    # must stay out of the optimizer too: ZeRO otherwise allocates gradient buffers for them and
+    # weight decay would keep updating parameters that receive no gradient.
+    frozen_params.update(id(p) for p in model.parameters() if not p.requires_grad)
+
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
             continue
@@ -103,6 +108,14 @@ def build_param_lr_groups(model, cfg):
     other_params = [p for p in model.parameters() if id(p) not in used_params and id(p) not in frozen_params]
     if other_params:
         param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
+
+    num_optimized = sum(sum(p.numel() for p in group["params"]) for group in param_groups)
+    num_total = sum(p.numel() for p in model.parameters())
+    print(
+        f"[param groups] optimized {num_optimized / 1e6:.1f}M / {num_total / 1e6:.1f}M params, "
+        f"frozen {(num_total - num_optimized) / 1e6:.1f}M, "
+        f"groups {[(group['name'], group['lr']) for group in param_groups]}"
+    )
 
     return param_groups
 

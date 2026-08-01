@@ -7,9 +7,9 @@ Scope (see DynaWeave/docs/implementation-plan.md §10 and AGENTS.md §11):
   - future-substitution invariance: swapping the future clip must not move action outputs
   - Fast Policy graph excludes the world/depth modules
 
-These tests characterise the BASELINE as it is. Where the baseline violates a project
-invariant, the test is marked xfail with the reason instead of being weakened, so the gap
-stays visible until the iteration that is allowed to fix it (I2).
+These tests characterise the BASELINE as it is. Baseline gaps were recorded as strict xfail
+instead of being weakened, so they stayed visible until the iteration allowed to fix them; the
+two teacher-freeze gaps were closed in I2 by VJBackboneAdapter and now assert normally.
 
 Requires one visible GPU and the local checkpoints; skipped otherwise.
 Run:  CUDA_VISIBLE_DEVICES=4 pytest tests/test_i1_smoke.py -v
@@ -254,7 +254,7 @@ def test_published_libero_checkpoint_loads_strict(model, cfg):
 
 
 # --------------------------------------------------------------------------------------
-# gradient firewall (AGENTS §6) — baseline gaps, expected to be closed in I2
+# gradient firewall (AGENTS §6) — the two freeze gaps were closed in I2 (VJBackboneAdapter)
 # --------------------------------------------------------------------------------------
 
 def test_target_encoder_receives_no_gradient(model, cfg):
@@ -267,21 +267,11 @@ def test_target_encoder_receives_no_gradient(model, cfg):
     model.zero_grad(set_to_none=True)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BASELINE GAP: VLA_JEPA.__init__ loads the V-JEPA teacher without requires_grad=False. "
-    "Only no_grad() protects it. Scheduled for I2 (VJBackboneAdapter).",
-)
 def test_target_encoder_params_are_frozen(model):
     trainable = [n for n, p in model.vj_encoder.named_parameters() if p.requires_grad]
     assert trainable == [], f"{len(trainable)} teacher params are trainable, e.g. {trainable[:3]}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BASELINE GAP: the teacher follows the parent's train()/eval() state instead of staying "
-    "in eval(). Scheduled for I2 (VJBackboneAdapter).",
-)
 def test_target_encoder_stays_in_eval_after_parent_train(model):
     model.train()
     try:

@@ -28,6 +28,7 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
+from starVLA.model.modules.world_model.vj_backbone_adapter import VJBackboneAdapter
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -80,6 +81,13 @@ class VLA_JEPA(baseframework):
         
         self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
         self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        # Owns the frozen-teacher firewall and the patch geometry. Keeps `vj_encoder` as a direct
+        # submodule so published checkpoints still load with strict=True.
+        self.vj_backbone = VJBackboneAdapter(
+            encoder=self.vj_encoder,
+            processor=self.vj_processor,
+            num_frames=self.config.framework.vj2_model.num_frames,
+        )
 
         tubelet_size = self.vj_encoder.config.tubelet_size
         self.vj_predictor = VisionTransformerPredictorAC(
@@ -99,7 +107,13 @@ class VLA_JEPA(baseframework):
 
         self.embodied_replace_prompt = "".join([embodied_action_token * self.config.framework.vj2_model.num_embodied_action_tokens_per_instruction])
 
-    def expand_tokenizer(self, 
+    def train(self, mode: bool = True):
+        """Keep the frozen teacher in eval mode when the parent switches to train (AGENTS.md 6)."""
+        super().train(mode)
+        self.vj_backbone.enforce_frozen()
+        return self
+
+    def expand_tokenizer(self,
                          tokenizer: AutoTokenizer,
                          special_action_token: str = "<|action_{}|>",
                          max_action_tokens: int = 32,
@@ -213,25 +227,12 @@ class VLA_JEPA(baseframework):
             #exit()
         
             # Step 2: JEPA Encoder
-            B, V, T, C, H, W = batch_videos.shape
-            batch_videos = batch_videos.reshape(B*V, T, C, H, W)  # [B*V, T, C, H, W]
-            input_videos = []
-            for i in range(B*V):
-                input_videos.append(self.vj_processor(
-                    videos=batch_videos[i], return_tensors="pt"
-                )["pixel_values_videos"].to(self.vj_encoder.device))
-            input_videos = torch.cat(input_videos, dim=0)  # [B*V, T, C, H, W]
-            with torch.no_grad():
-                video_embeddings = self.vj_encoder.get_vision_features(pixel_values_videos=input_videos)
-                video_embeddings = torch.cat(torch.chunk(video_embeddings, chunks=V, dim=0), dim=2)
-            #print(video_embeddings.shape) # [B, T//tubelet_size * dim_per_frame, V*embed_dim]
-        
+            # [B, num_temporal_blocks * tokens_per_block, V * encoder_dim]
+            video_embeddings = self.vj_backbone.encode_video(batch_videos)
+
             # Step 3: VJ Predictor
-            T = T // self.vj_encoder.config.tubelet_size
-            input_states = video_embeddings[:, :video_embeddings.shape[1] // T * (T-1),:]  # [B, (T-1)*dim_per_frame, V*embed_dim]
-            gt_states = video_embeddings[:, video_embeddings.shape[1] // T:, :]
-            #print(input_states.shape, action_tokens.shape)
-            #exit()
+            # both [B, (num_temporal_blocks - 1) * tokens_per_block, V * encoder_dim]
+            input_states, gt_states = self.vj_backbone.split_teacher_forcing(video_embeddings)
             predicted_states = self.vj_predictor(
                 input_states,
                 action_tokens

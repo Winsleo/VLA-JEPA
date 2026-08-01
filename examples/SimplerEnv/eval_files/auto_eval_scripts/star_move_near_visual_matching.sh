@@ -8,7 +8,8 @@ export star_vla_python=python
 : "${SimplerEnv_PATH:?SimplerEnv_PATH is not set (e.g. /path/to/SimplerEnv)}"
 #export SimplerEnv_PATH=/mnt/petrelfs/share/yejinhui/Projects/SimplerEnv
 #export PYTHONPATH=$(pwd):${PYTHONPATH}
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# GPU list is overridable; default keeps the upstream 8-GPU layout unchanged.
+export CUDA_VISIBLE_DEVICES=${EVAL_GPUS:-0,1,2,3,4,5,6,7}
 export SVULKAN2_CPU_COPY=1
 export SVULKAN2_DISABLE_DENOISER=1
 base_port=6680
@@ -41,7 +42,7 @@ start_service() {
   mkdir -p "${server_log_dir}"
   
   echo "▶️ Starting service on GPU ${gpu_id}, port ${port}"
-  CUDA_VISIBLE_DEVICES=${gpu_id} ${starvla_python} deployment/model_server/server_policy.py \
+  CUDA_VISIBLE_DEVICES=${gpu_id} ${star_vla_python} deployment/model_server/server_policy.py \
     --ckpt_path ${ckpt_path} \
     --port ${port} \
     --use_bf16 \

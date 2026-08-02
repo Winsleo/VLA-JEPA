@@ -265,8 +265,12 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Total episodes: {total_episodes}")
 
 
-def _get_libero_env(task, resolution, seed):
-    """Initializes and returns the LIBERO environment, along with the task description."""
+def _get_libero_env(task, resolution, seed, camera_depths=False):
+    """Initializes and returns the LIBERO environment, along with the task description.
+
+    `camera_depths` defaults to False, which keeps the evaluation protocol byte-identical to the
+    I1/I2 runs; it is only enabled by `record_geo_clips.py` to also render metric depth.
+    """
     task_description = task.language
     task_bddl_file = (
         pathlib.Path(get_libero_path("bddl_files"))
@@ -277,6 +281,7 @@ def _get_libero_env(task, resolution, seed):
         "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,
         "camera_widths": resolution,
+        "camera_depths": camera_depths,
     }
     env = OffScreenRenderEnv(**env_args)
     env.seed(

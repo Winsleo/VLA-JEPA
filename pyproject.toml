@@ -73,10 +73,19 @@ exclude = [
 line-length = 121
 target-version = ["py310"]
 preview = true
+# Vendored V-JEPA 2.1 modeling code: kept byte-identical to its upstream revision so it stays
+# diffable against it (see starVLA/model/modules/world_model/vjepa21/VENDOR.md). Formatting it would
+# destroy exactly the property it is vendored for.
+force-exclude = "starVLA/model/modules/world_model/vjepa21/(configuration|modeling)_vjepa21\\.py"
 
 [tool.ruff]
 line-length = 121
 target-version = "py310"
+# Same reason as [tool.black].force-exclude above.
+extend-exclude = [
+    "starVLA/model/modules/world_model/vjepa21/configuration_vjepa21.py",
+    "starVLA/model/modules/world_model/vjepa21/modeling_vjepa21.py",
+]
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "RUF", "W"]

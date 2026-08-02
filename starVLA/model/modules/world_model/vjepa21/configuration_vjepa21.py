@@ -1,6 +1,56 @@
 """V-JEPA 2.1 model configuration"""
 
+from typing import Optional
+
 from transformers import PretrainedConfig
+
+
+# Encoder hierarchical layers, from `app/vjepa_2_1/models/vision_transformer.py`
+# in `facebookresearch/vjepa2`.
+_ENCODER_LAYER_MAP = {
+    4: [0, 1, 2, 3],
+    8: [1, 3, 5, 7],
+    12: [2, 5, 8, 11],
+    20: [4, 9, 14, 19],
+    24: [5, 11, 17, 23],
+    40: [9, 19, 29, 39],
+    48: [11, 23, 37, 47],
+}
+
+# Predictor hierarchical layers, from `app/vjepa_2_1/models/predictor.py`.
+# NOTE: this is *not* the same table as the encoder's. At depth 24 the reference
+# predictor uses [4, 11, 17, 23] while the encoder uses [5, 11, 17, 23], and the
+# predictor table has no entry for depth 48. Sharing one table happens to work
+# today because only `len(...)` is consumed, but it would silently produce wrong
+# indices as soon as multi-level predictor outputs are exposed.
+_PREDICTOR_LAYER_MAP = {
+    4: [0, 1, 2, 3],
+    8: [1, 3, 5, 7],
+    12: [2, 5, 8, 11],
+    20: [4, 9, 14, 19],
+    24: [4, 11, 17, 23],
+    40: [9, 19, 29, 39],
+}
+
+
+def _get_hierarchical_layers(depth: int) -> list[int]:
+    """Encoder hierarchical layer indices for a given depth."""
+    if depth not in _ENCODER_LAYER_MAP:
+        raise ValueError(
+            f"Unsupported encoder depth {depth}. Supported depths: "
+            f"{list(_ENCODER_LAYER_MAP.keys())}"
+        )
+    return _ENCODER_LAYER_MAP[depth]
+
+
+def _get_predictor_hierarchical_layers(depth: int) -> list[int]:
+    """Predictor hierarchical layer indices for a given depth."""
+    if depth not in _PREDICTOR_LAYER_MAP:
+        raise ValueError(
+            f"Unsupported predictor depth {depth}. Supported depths: "
+            f"{list(_PREDICTOR_LAYER_MAP.keys())}"
+        )
+    return _PREDICTOR_LAYER_MAP[depth]
 
 
 class VJEPA21Config(PretrainedConfig):
@@ -19,7 +69,8 @@ class VJEPA21Config(PretrainedConfig):
         crop_size (`int`, defaults to 384):
             Input resolution of the model.
         frames_per_clip (`int`, defaults to 64):
-            Number of frames in a video clip.
+            Number of frames in a video clip used during pre-training. This is
+            informational: the model accepts any number of frames at inference.
         tubelet_size (`int`, defaults to 2):
             Temporal patch size (number of frames per tubelet).
         hidden_size (`int`, defaults to 1024):
@@ -61,7 +112,15 @@ class VJEPA21Config(PretrainedConfig):
         has_cls_first (`bool`, defaults to False):
             Whether the sequence starts with a CLS token.
         num_pooler_layers (`int`, defaults to 3):
-            Number of self-attention layers in the attentive pooler.
+            Number of self-attention layers in the attentive pooler. Together with
+            the cross-attention layer this reproduces `AttentivePooler(depth=4)`,
+            which is `num_probe_blocks: 4` in the reference evaluation configs.
+        num_pooler_heads (`int` or `None`, defaults to 16):
+            Number of attention heads in the attentive pooler. 16 is the value used
+            by every frozen-probe config under `configs/eval_2_1/` in the reference
+            repository (`classifier.num_heads: 16`), for all four model sizes, so it
+            is the default here rather than `num_attention_heads`. The pooler is
+            always trained from scratch, so this only affects the probe you train.
         pred_hidden_size (`int`, defaults to 384):
             Predictor embedding dimension.
         pred_num_attention_heads (`int`, defaults to 12):
@@ -102,7 +161,7 @@ class VJEPA21Config(PretrainedConfig):
         initializer_range: float = 0.02,
         attention_probs_dropout_prob: float = 0.0,
         # V-JEPA 2.1 specific
-        img_temporal_dim_size: int | None = 1,
+        img_temporal_dim_size: Optional[int] = 1,
         interpolate_rope: bool = True,
         modality_embedding: bool = True,
         n_output_distillation: int = 4,
@@ -110,6 +169,7 @@ class VJEPA21Config(PretrainedConfig):
         has_cls_first: bool = False,
         # Pooler
         num_pooler_layers: int = 3,
+        num_pooler_heads: Optional[int] = 16,
         # Predictor
         pred_hidden_size: int = 384,
         pred_num_attention_heads: int = 12,
@@ -117,11 +177,12 @@ class VJEPA21Config(PretrainedConfig):
         pred_num_mask_tokens: int = 8,
         pred_zero_init_mask_tokens: bool = True,
         pred_mlp_ratio: float = 4.0,
-        pred_teacher_embed_dim: int | None = None,
+        pred_teacher_embed_dim: Optional[int] = None,
         pred_return_all_tokens: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
+
         self.patch_size = patch_size
         self.crop_size = crop_size
         self.frames_per_clip = frames_per_clip
@@ -149,6 +210,7 @@ class VJEPA21Config(PretrainedConfig):
 
         # Pooler
         self.num_pooler_layers = num_pooler_layers
+        self.num_pooler_heads = num_pooler_heads if num_pooler_heads is not None else 16
 
         # Predictor
         self.pred_hidden_size = pred_hidden_size
@@ -160,22 +222,69 @@ class VJEPA21Config(PretrainedConfig):
         self.pred_teacher_embed_dim = pred_teacher_embed_dim
         self.pred_return_all_tokens = pred_return_all_tokens
 
+        self._validate()
+
+    def _validate(self) -> None:
+        n_levels = len(_get_hierarchical_layers(self.num_hidden_layers))
+        n_pred_levels = len(_get_predictor_hierarchical_layers(self.pred_num_hidden_layers))
+        if not 1 <= self.n_output_distillation <= n_levels:
+            raise ValueError(
+                f"n_output_distillation must be in [1, {n_levels}] for a model with "
+                f"{self.num_hidden_layers} layers, got {self.n_output_distillation}."
+            )
+        if self.n_output_distillation > n_pred_levels:
+            raise ValueError(
+                f"n_output_distillation ({self.n_output_distillation}) exceeds the "
+                f"{n_pred_levels} hierarchical levels available in a predictor with "
+                f"{self.pred_num_hidden_layers} layers."
+            )
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_attention_heads ({self.num_attention_heads})."
+            )
+        if self.hidden_size % self.num_pooler_heads != 0:
+            raise ValueError(
+                f"hidden_size ({self.hidden_size}) must be divisible by "
+                f"num_pooler_heads ({self.num_pooler_heads})."
+            )
+        if self.pred_hidden_size % self.pred_num_attention_heads != 0:
+            raise ValueError(
+                f"pred_hidden_size ({self.pred_hidden_size}) must be divisible by "
+                f"pred_num_attention_heads ({self.pred_num_attention_heads})."
+            )
+        if self.pred_teacher_embed_dim is not None:
+            if self.pred_teacher_embed_dim % self.n_output_distillation != 0:
+                raise ValueError(
+                    f"pred_teacher_embed_dim ({self.pred_teacher_embed_dim}) must be "
+                    f"divisible by n_output_distillation ({self.n_output_distillation})."
+                )
+        if self.tubelet_size < 1:
+            raise ValueError(f"tubelet_size must be >= 1, got {self.tubelet_size}.")
+        if self.pred_num_mask_tokens < 1:
+            raise ValueError(
+                f"pred_num_mask_tokens must be >= 1, got {self.pred_num_mask_tokens}."
+            )
+
     @property
     def encoder_hierarchical_layers(self) -> list[int]:
-        """Layer indices for hierarchical output collection in the encoder."""
+        """Layer indices at which the encoder carries a per-level LayerNorm."""
         return _get_hierarchical_layers(self.num_hidden_layers)
 
     @property
     def encoder_distillation_layers(self) -> list[int]:
-        """Layer indices used for distillation output in the encoder."""
+        """Encoder layer indices contributing to the hierarchical output."""
         all_layers = _get_hierarchical_layers(self.num_hidden_layers)
         return all_layers[-self.n_output_distillation :]
 
     @property
     def predictor_hierarchical_layers(self) -> list[int]:
-        """Layer indices for hierarchical output in the predictor."""
-        all_layers = _get_hierarchical_layers(self.pred_num_hidden_layers)
-        # Predictor uses n_output_distillation from its own kwargs
+        """Predictor layer indices for hierarchical output.
+
+        Uses the predictor's own depth table, which differs from the encoder's at
+        depth 24 (`[4, 11, 17, 23]` vs `[5, 11, 17, 23]`).
+        """
+        all_layers = _get_predictor_hierarchical_layers(self.pred_num_hidden_layers)
         return all_layers[-self.n_output_distillation :]
 
     @property
@@ -186,19 +295,4 @@ class VJEPA21Config(PretrainedConfig):
         return int(256 / self.patch_size)
 
 
-def _get_hierarchical_layers(depth: int) -> list[int]:
-    """Get hierarchical layer indices based on model depth."""
-    _LAYER_MAP = {
-        4: [0, 1, 2, 3],
-        8: [1, 3, 5, 7],
-        12: [2, 5, 8, 11],
-        20: [4, 9, 14, 19],
-        24: [5, 11, 17, 23],
-        40: [9, 19, 29, 39],
-        48: [11, 23, 37, 47],
-    }
-    if depth not in _LAYER_MAP:
-        raise ValueError(
-            f"Unsupported depth {depth}. Supported depths: {list(_LAYER_MAP.keys())}"
-        )
-    return _LAYER_MAP[depth]
+__all__ = ["VJEPA21Config"]

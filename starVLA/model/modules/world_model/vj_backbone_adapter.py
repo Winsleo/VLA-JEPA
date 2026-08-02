@@ -18,28 +18,57 @@ drop-path rates are all 0.0 and the feature extraction already ran under `no_gra
 is why it can be introduced inside the I2 parity iteration.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
+
+from starVLA.model.modules.world_model.spatial_token_resampler import SpatialTokenResampler
+
+# Config keys a teacher may state its square input size under, in order of preference. V-JEPA 2
+# uses `image_size`; V-JEPA 2.1 has no `image_size` at all and states `crop_size` instead.
+INPUT_SIZE_KEYS = ("image_size", "crop_size")
+
+
+def resolve_input_size(config) -> int:
+    """Square input edge the encoder was configured for, from whichever key it publishes.
+
+    A missing key is not the same as a differing value: reading `config.image_size` on a V-JEPA 2.1
+    config raises `AttributeError` deep inside the adapter, so the supported keys are tried in order
+    and an unknown geometry is reported as such.
+    """
+    for key in INPUT_SIZE_KEYS:
+        size = getattr(config, key, None)
+        if isinstance(size, int):
+            return size
+    raise ValueError(f"encoder config states no input size; tried {INPUT_SIZE_KEYS}")
 
 
 class VJBackboneAdapter:
     """Frozen video teacher: geometry contract + multi-view feature extraction.
 
     Attributes:
-        image_size / patch_size / tubelet_size / hidden_size: pinned encoder config values.
-        grid_size: (height, width) patch grid of one temporal block.
-        tokens_per_block: tokens the encoder emits per temporal block (grid height * width).
+        image_size: square input edge, from `config.image_size` or `config.crop_size`.
+        patch_size / tubelet_size / hidden_size: pinned encoder config values.
+        native_grid_size / native_tokens_per_block: patch grid the encoder itself emits.
+        grid_size: (height, width) patch grid of one temporal block as seen by consumers, i.e.
+            after the optional resampler.
+        tokens_per_block: tokens per temporal block on `grid_size`.
         num_temporal_blocks: temporal blocks per clip, `num_frames // tubelet_size`.
     """
 
-    def __init__(self, encoder, processor, num_frames: int) -> None:
+    def __init__(
+        self,
+        encoder,
+        processor,
+        num_frames: int,
+        resampler: Optional[SpatialTokenResampler] = None,
+    ) -> None:
         self.encoder = encoder
         self.processor = processor
 
         config = encoder.config
-        self.image_size: int = config.image_size
+        self.image_size: int = resolve_input_size(config)
         self.patch_size: int = config.patch_size
         self.tubelet_size: int = config.tubelet_size
         self.hidden_size: int = config.hidden_size
@@ -51,9 +80,22 @@ class VJBackboneAdapter:
 
         grid = self.image_size // self.patch_size
         self.num_frames: int = num_frames
-        self.grid_size: Tuple[int, int] = (grid, grid)
-        self.tokens_per_block: int = grid * grid
         self.num_temporal_blocks: int = num_frames // self.tubelet_size
+        self.native_grid_size: Tuple[int, int] = (grid, grid)
+        self.native_tokens_per_block: int = grid * grid
+
+        # `resampler=None` is the pinned path: geometry and features are then exactly what the
+        # encoder produces, so the V-JEPA 2 arm stays bitwise what I2 measured.
+        self.resampler = resampler
+        if resampler is None:
+            self.grid_size: Tuple[int, int] = self.native_grid_size
+        else:
+            if tuple(resampler.grid_in) != self.native_grid_size:
+                raise ValueError(
+                    f"resampler expects a {tuple(resampler.grid_in)} grid, encoder emits {self.native_grid_size}"
+                )
+            self.grid_size = tuple(resampler.grid_out)
+        self.tokens_per_block: int = self.grid_size[0] * self.grid_size[1]
 
         self.enforce_frozen()
 
@@ -91,6 +133,10 @@ class VJBackboneAdapter:
         with torch.no_grad():
             features = self.encoder.get_vision_features(pixel_values_videos=pixel_values)
             features = torch.cat(torch.chunk(features, chunks=num_views, dim=0), dim=2)
+            if self.resampler is not None:
+                # After fusion, not before: the resampler leaves the channel axis alone, so the two
+                # orders are equal (pinned by a test), and pooling once is the cheaper of them.
+                features = self.resampler(features)
 
         expected = (
             batch_size,

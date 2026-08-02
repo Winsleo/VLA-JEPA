@@ -16,23 +16,27 @@ host="127.0.0.1"
 base_port=15083
 unnorm_key="franka"
 index=3 # GPUs 0-3 are occupied by another job; README allows adapting the parallelization
-num_trials_per_task=50
+# I1-S4 / I2-V6: trial count, seed and GPU list are overridable so the same checkpoint can be
+# re-measured without editing the script again. The defaults reproduce the layout above, i.e.
+# 50 trials per task on GPUs 4-7, one suite per GPU.
+num_trials_per_task=${NUM_TRIALS:-50}
 with_state="true"
-# I1-S4: eval seed is overridable so the same checkpoint can be measured across seeds.
-# Default 7 keeps the client's own default, i.e. unchanged behaviour.
 seed=${SEED:-7}
+IFS=',' read -r -a eval_gpus <<< "${EVAL_GPUS:-4,5,6,7}"
 
 # start each task suite on specific GPU.
 for task_suite_name in "${items[@]}"
 do
     index=$((index+1))
     port=$((base_port+index))
+    # Wrap around when fewer GPUs than suites are given, so EVAL_GPUS=0 co-locates all four.
+    cuda=${eval_gpus[$(((index - 4) % ${#eval_gpus[@]}))]}
 
     python ./deployment/model_server/server_policy.py \
         --ckpt_path ${your_ckpt} \
         --port ${port} \
         --use_bf16 \
-        --cuda ${index} &
+        --cuda ${cuda} &
 
     video_out_path="results/${task_suite_name}/${folder_name}_seed${seed}"
 

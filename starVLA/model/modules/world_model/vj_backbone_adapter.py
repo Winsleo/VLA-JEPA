@@ -48,7 +48,8 @@ class VJBackboneAdapter:
     """Frozen video teacher: geometry contract + multi-view feature extraction.
 
     Attributes:
-        image_size: square input edge, from `config.image_size` or `config.crop_size`.
+        image_size: square input edge the geometry is derived from, from `input_size` when given,
+            else `config.image_size`, else `config.crop_size`.
         patch_size / tubelet_size / hidden_size: pinned encoder config values.
         native_grid_size / native_tokens_per_block: patch grid the encoder itself emits.
         grid_size: (height, width) patch grid of one temporal block as seen by consumers, i.e.
@@ -63,12 +64,27 @@ class VJBackboneAdapter:
         processor,
         num_frames: int,
         resampler: Optional[SpatialTokenResampler] = None,
+        input_size: Optional[int] = None,
     ) -> None:
+        """Bind a frozen encoder to the geometry its features will be read with.
+
+        Args:
+            resampler: optional non-learned spatial pooling. `None` leaves features exactly as the
+                encoder emits them.
+            input_size: square input edge to derive the geometry from, overriding the config. Needed
+                when a teacher runs at a resolution its config does not state: V-JEPA 2.1 pins
+                `crop_size=384`, but its RoPE is interpolatable and the patch grid is taken from the
+                input tensor, so the same weights also run natively at 256. `input_size` only
+                *declares* which resolution the caller feeds; `encode_video`'s shape assertion is
+                what verifies the processor actually delivers it.
+        """
         self.encoder = encoder
         self.processor = processor
 
         config = encoder.config
-        self.image_size: int = resolve_input_size(config)
+        self.image_size: int = resolve_input_size(config) if input_size is None else input_size
+        if not isinstance(self.image_size, int) or self.image_size <= 0:
+            raise ValueError(f"input_size must be a positive int, got {input_size!r}")
         self.patch_size: int = config.patch_size
         self.tubelet_size: int = config.tubelet_size
         self.hidden_size: int = config.hidden_size

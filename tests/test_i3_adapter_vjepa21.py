@@ -25,6 +25,8 @@ VJEPA21_WEIGHTS = Path("/vepfs/wangshilong/models/dynaweave/vjepa21/port_apianto
 # Matched field of view: 438 -> 384 and 292 -> 256 share the crop ratio 0.8767, so both teacher
 # arms see the same crop through the same pinned processor class (see the module's VENDOR.md).
 SHORTEST_EDGE_384 = 438
+# The V-JEPA 2 processor's own pinned pair, reused by arm D so it matches arm A exactly.
+SHORTEST_EDGE_256 = 292
 
 NUM_FRAMES = 8
 NUM_VIEWS = 2
@@ -41,12 +43,13 @@ def _stub_encoder(**config_fields):
     return encoder
 
 
-def _adapter(resampler=None, **config_fields):
+def _adapter(resampler=None, input_size=None, **config_fields):
     return VJBackboneAdapter(
         encoder=_stub_encoder(**config_fields),
         processor=None,
         num_frames=NUM_FRAMES,
         resampler=resampler,
+        input_size=input_size,
     )
 
 
@@ -104,6 +107,38 @@ def test_the_2_path_is_unchanged_by_the_fallback():
 def test_a_non_divisible_input_size_is_still_refused():
     with pytest.raises(ValueError, match="multiple of patch_size"):
         _adapter(crop_size=380)
+
+
+# --------------------------------------------------------------------------------------
+# input-size override: arm D runs 2.1 at a resolution its config does not state
+# --------------------------------------------------------------------------------------
+
+def test_an_explicit_input_size_overrides_the_config():
+    adapter = _adapter(input_size=256, crop_size=384)
+    assert adapter.image_size == 256
+    assert adapter.native_grid_size == MATCHED_GRID
+    assert adapter.tokens_per_block == 256
+
+
+def test_the_override_is_the_only_way_arm_d_geometry_is_reachable():
+    """Without it the config's 384 wins and the 256 features fail the shape assertion."""
+    assert _adapter(crop_size=384).native_grid_size == NATIVE_GRID
+
+
+def test_an_override_that_is_not_divisible_by_the_patch_size_is_refused():
+    with pytest.raises(ValueError, match="multiple of patch_size"):
+        _adapter(input_size=250, crop_size=384)
+
+
+@pytest.mark.parametrize("bad", [0, -256, 256.0, "256"])
+def test_a_malformed_override_is_refused(bad):
+    with pytest.raises(ValueError, match="positive int"):
+        _adapter(input_size=bad, crop_size=384)
+
+
+def test_the_override_leaves_a_config_stated_geometry_alone():
+    """`input_size=None` must keep the pinned V-JEPA 2 path bit-for-bit as I2 measured it."""
+    assert _adapter(input_size=None, image_size=256).grid_size == MATCHED_GRID
 
 
 # --------------------------------------------------------------------------------------
@@ -179,6 +214,23 @@ def matched_adapter(encoder_and_processor):
     )
 
 
+@pytest.fixture(scope="module")
+def arm_d_adapter(encoder_and_processor):
+    """Arm D: the same 2.1 weights at 256, where the patch grid is natively 16x16."""
+    from transformers import VJEPA2VideoProcessor
+
+    encoder, _ = encoder_and_processor
+    return VJBackboneAdapter(
+        encoder=encoder,
+        processor=VJEPA2VideoProcessor(
+            size={"shortest_edge": SHORTEST_EDGE_256},
+            crop_size={"height": 256, "width": 256},
+        ),
+        num_frames=NUM_FRAMES,
+        input_size=256,
+    )
+
+
 def test_the_vendored_config_states_the_expected_geometry(native_adapter):
     config = native_adapter.encoder.config
     assert not hasattr(config, "image_size"), "config gained an image_size; the fallback is now untested"
@@ -232,3 +284,53 @@ def test_encoding_the_same_clip_twice_is_bitwise_identical(matched_adapter):
     """Probe features are cached once and reused across seeds, so drift here would be invisible."""
     clips = _clips((1, 2))
     assert torch.equal(matched_adapter.encode_video(clips), matched_adapter.encode_video(clips))
+
+
+# --------------------------------------------------------------------------------------
+# arm D: 2.1 at 256, the single-variable control against arm A
+# --------------------------------------------------------------------------------------
+
+def test_rope_is_the_identity_at_256_and_interpolated_at_384(native_adapter):
+    """Why arm D is legitimate rather than out-of-distribution positional encoding.
+
+    `pretrained_grid_size` is 256 // patch_size = 16 and the RoPE rescale factor is
+    `(pretrained_grid_size - 1) / (patches - 1)`, so a 16x16 grid is the interpolation *basis*
+    (factor 1.0) and 24x24 is the interpolated case. The patch grid itself comes from the input
+    tensor (`modeling_vjepa21.py`, `H_patches = H // patch_size`), not from `config.crop_size`,
+    which is what lets one set of weights serve both arms.
+    """
+    config = native_adapter.encoder.config
+    assert config.pretrained_grid_size == 16
+    assert (config.pretrained_grid_size - 1) / (256 // config.patch_size - 1) == 1.0
+    assert (config.pretrained_grid_size - 1) / (384 // config.patch_size - 1) < 1.0
+
+
+def test_arm_d_encodes_onto_a_native_16x16_grid(arm_d_adapter):
+    assert arm_d_adapter.image_size == 256
+    assert arm_d_adapter.native_grid_size == MATCHED_GRID
+    assert arm_d_adapter.resampler is None
+    assert arm_d_adapter.encode_video(_clips((1, 2))).shape == (1, 4 * 256, NUM_VIEWS * 1024)
+
+
+def test_arm_d_is_not_a_copy_of_arm_c(arm_d_adapter, matched_adapter):
+    """Same weights and same output grid, but a different input resolution: related, not equal."""
+    clips = _clips((1, 2))
+    native_16 = arm_d_adapter.encode_video(clips)
+    pooled_24 = matched_adapter.encode_video(clips)
+    assert native_16.shape == pooled_24.shape
+    assert not torch.equal(native_16, pooled_24)
+
+
+def test_arm_d_features_are_not_degenerate(arm_d_adapter):
+    """A wrong-resolution forward could collapse without failing any shape assertion."""
+    features = arm_d_adapter.encode_video(_clips((1, 2)))[0].float()
+    assert torch.isfinite(features).all()
+    assert (features.std(dim=0) < 1e-3).sum() == 0, "collapsed feature dimensions"
+    assert features.norm(dim=-1).min() > 0
+
+
+def test_arm_d_is_frozen_and_deterministic(arm_d_adapter):
+    clips = _clips((1, 2))
+    assert [name for name, param in arm_d_adapter.encoder.named_parameters() if param.requires_grad] == []
+    assert not arm_d_adapter.encoder.training
+    assert torch.equal(arm_d_adapter.encode_video(clips), arm_d_adapter.encode_video(clips))

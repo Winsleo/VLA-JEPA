@@ -53,8 +53,15 @@ def features_dir(root, arm_name: str) -> Path:
     return Path(root) / FEATURES_DIR / arm_name
 
 
-def targets_dir(root, grid: Tuple[int, int]) -> Path:
-    return Path(root) / TARGETS_DIR / f"{grid[0]}x{grid[1]}"
+def targets_dir(root, grid: Tuple[int, int], estimator: Optional[str] = None) -> Path:
+    """Directory of one target set. `estimator` names a pseudo-depth source; None is the simulator.
+
+    The estimator is part of the *path* rather than a field inside one shared directory so that the
+    simulator targets and every estimator's targets can coexist and be fitted against separately --
+    and so that a probe run cannot read a pseudo target set while believing it holds ground truth.
+    """
+    suffix = f"{grid[0]}x{grid[1]}" if estimator is None else f"{grid[0]}x{grid[1]}__{estimator}"
+    return Path(root) / TARGETS_DIR / suffix
 
 
 def create_features(directory, num_rows: int, tokens: int, dim: int) -> np.memmap:

@@ -20,6 +20,12 @@ Four stages, run in order:
     # probes, three seeds per arm, plus a closed-form ridge check and the feature-free baselines
     python scripts/run_geo_probes.py fit --arms A C D --kinds state delta
 
+The same `targets` and `fit` stages take `--estimator <name>` to swap the simulator depth for a
+precomputed pseudo-depth cache (`scripts/precompute_depth_targets.py`). That answers the S4 question
+"how much probe signal survives if the target comes from an estimator rather than the simulator": the
+arms, features, seeds and grid are identical, so the difference is the target source alone. Pseudo
+targets live in their own cache directory, never overwriting the ground-truth ones.
+
 The fit stage reports two floors next to the arms: the seed spread, which any claimed improvement has
 to clear, and the constant predictors of `geo_probe.constant_baselines`, which say how much of an
 arm's absolute number is the representation rather than a fixed camera looking at a fixed table.
@@ -50,6 +56,8 @@ from starVLA.dataloader.depth_cache_dataset import DepthClipCacheDataset  # noqa
 from starVLA.model.modules.world_model.depth_targets import (  # noqa: E402
     DEFAULT_D_MAX,
     DEFAULT_D_MIN,
+    TARGET_TYPE_METRIC,
+    TARGET_TYPE_PSEUDO_METRIC,
     build_metric_delta_targets,
 )
 from starVLA.probes import arms as arm_registry  # noqa: E402
@@ -59,6 +67,7 @@ DEFAULT_CLIPS = Path("/vepfs/wangshilong/data/dynaweave/i3_geo_clips")
 DEFAULT_OUT = Path("/vepfs/wangshilong/data/dynaweave/i3_probe_cache")
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "i1_libero_local.yaml"
 DEFAULT_VJEPA21 = Path("/vepfs/wangshilong/models/dynaweave/vjepa21/port_apiantonio")
+DEFAULT_PSEUDO = Path("/vepfs/wangshilong/data/dynaweave/i3_pseudo_depth")
 
 # The one judging grid. Arm B's native 24x24 is absent on purpose: depth targets are pooled with
 # exact non-overlapping windows and 24 does not divide the recorded 256x256 depth map, so a 24x24
@@ -117,10 +126,41 @@ def _row_index(dataset: DepthClipCacheDataset) -> Dict:
 # stage: depth targets
 # --------------------------------------------------------------------------------------
 
+def _estimator_provenance(pseudo_root: Path, estimator: str, num_clips: int) -> Dict:
+    """The pseudo cache's own index, minus its path list, refusing an unfinished cache.
+
+    Probe numbers are only interpretable next to which estimator produced the targets and whether it
+    reported metres itself, so those fields travel into the target index rather than being looked up
+    by hand later.
+    """
+    index = json.loads((pseudo_root / estimator / "estimator.json").read_text())
+    if not index.get("complete", True) or index.get("num_present", 0) < num_clips:
+        raise SystemExit(
+            f"pseudo cache {pseudo_root / estimator} holds {index.get('num_present')} of {num_clips} clips"
+        )
+    return {key: value for key, value in index.items() if key != "paths"}
+
+
+def _pseudo_depth(pseudo_root: Path, estimator: str, paths: Sequence[str]) -> torch.Tensor:
+    """Precomputed estimator depth for one batch, in the dataset's `[B, V, T, 1, H, W]` layout.
+
+    The pseudo cache mirrors the clip cache path for path, so a row is located by its own relative
+    path rather than by position -- a missing file is an error, never a silently shorter batch.
+    """
+    clips = []
+    for path in paths:
+        with np.load(pseudo_root / estimator / path) as clip:
+            depth = torch.from_numpy(clip["depth_m"].astype(np.float32))  # [T, V, H, W]
+        clips.append(depth.permute(1, 0, 2, 3).unsqueeze(2))
+    return torch.stack(clips)
+
+
 def run_targets(args: argparse.Namespace) -> None:
     dataset = _dataset(args.clips)
     grids = [tuple(grid) for grid in args.grids]
-    print(f"targets: {len(dataset)} clips -> grids {grids}", flush=True)
+    estimator = getattr(args, "estimator", None)
+    source = "simulator metric depth" if estimator is None else f"pseudo depth from {estimator}"
+    print(f"targets: {len(dataset)} clips -> grids {grids} ({source})", flush=True)
 
     buffers: Dict[Tuple[int, int], Dict[str, List[np.ndarray]]] = {
         grid: {"states": [], "states_mask": [], "deltas": [], "deltas_mask": []} for grid in grids
@@ -130,6 +170,11 @@ def run_targets(args: argparse.Namespace) -> None:
     for batch in _loader(dataset, args.batch_size, args.num_workers):
         # `[B, V, T, 1, H, W]` as `build_metric_delta_targets` expects.
         depth, valid = batch["depth"], batch["valid"]
+        if estimator is not None:
+            # The estimator's own finiteness is the only validity it has: reusing the simulator's
+            # sensor mask here would hand the pseudo path information it would not have on a dataset
+            # without depth, which is exactly the situation this run is measuring.
+            depth, valid = _pseudo_depth(args.pseudo_root, estimator, batch["path"]), None
         for grid in grids:
             states, deltas = build_metric_delta_targets(
                 cache_depth=depth,
@@ -138,6 +183,7 @@ def run_targets(args: argparse.Namespace) -> None:
                 grid=grid,
                 d_min=args.d_min,
                 d_max=args.d_max,
+                target_type=TARGET_TYPE_METRIC if estimator is None else TARGET_TYPE_PSEUDO_METRIC,
             )
             target_type = states.target_type
             store = buffers[grid]
@@ -149,7 +195,7 @@ def run_targets(args: argparse.Namespace) -> None:
     index_rows = _row_index(dataset)
     for grid in grids:
         stacked = {name: np.concatenate(chunks, axis=0) for name, chunks in buffers[grid].items()}
-        directory = probe_cache.targets_dir(args.out, grid)
+        directory = probe_cache.targets_dir(args.out, grid, estimator)
         index = {
             **index_rows,
             "grid": list(grid),
@@ -162,6 +208,10 @@ def run_targets(args: argparse.Namespace) -> None:
             "deltas_shape": list(stacked["deltas"].shape),
             "states_valid_fraction": float(stacked["states_mask"].mean()),
             "deltas_valid_fraction": float(stacked["deltas_mask"].mean()),
+            "estimator": estimator,
+            "estimator_index": (
+                None if estimator is None else _estimator_provenance(args.pseudo_root, estimator, len(dataset))
+            ),
             "provenance": _provenance(args.clips),
         }
         probe_cache.write_targets(directory, index=index, **stacked)
@@ -415,7 +465,7 @@ def _summarise(seed_runs: List[Dict]) -> Dict[str, Dict[str, float]]:
 
 def run_fit(args: argparse.Namespace) -> None:
     grid = tuple(args.grid)
-    targets = probe_cache.TargetCache.open(probe_cache.targets_dir(args.out, grid))
+    targets = probe_cache.TargetCache.open(probe_cache.targets_dir(args.out, grid, args.estimator))
     config = geo_probe.FitConfig(
         lr_grid=args.lr_grid,
         epochs=args.epochs,
@@ -489,6 +539,8 @@ def run_fit(args: argparse.Namespace) -> None:
     report = {
         "grid": list(grid),
         "target_type": targets.target_type,
+        "estimator": args.estimator,
+        "estimator_index": targets.index.get("estimator_index"),
         "seeds": list(args.seeds),
         "selection": {
             "split": "val",
@@ -547,7 +599,8 @@ def _primary_comparison(results: Dict[str, Dict], kinds: Sequence[str]) -> Dict:
 
 def _markdown(report: Dict) -> str:
     """Results table with the two metric classes kept in separate blocks."""
-    lines = [f"### I3 probe results (grid {report['grid']}, target {report['target_type']})", ""]
+    source = report.get("estimator") or "simulator"
+    lines = [f"### I3 probe results (grid {report['grid']}, target {report['target_type']}, source {source})", ""]
     for kind in sorted({kind for arm in report["arms"].values() for kind in arm["probes"]}):
         rows = {name: arm["probes"][kind]["summary"] for name, arm in report["arms"].items() if kind in arm["probes"]}
         if not rows:
@@ -611,6 +664,12 @@ def build_parser() -> argparse.ArgumentParser:
     targets.add_argument("--grids", type=_grid_pair, nargs="+", default=list(DEFAULT_GRIDS))
     targets.add_argument("--d-min", type=float, default=DEFAULT_D_MIN)
     targets.add_argument("--d-max", type=float, default=DEFAULT_D_MAX)
+    targets.add_argument(
+        "--estimator",
+        default=None,
+        help="build targets from this estimator's pseudo-depth cache instead of the simulator depth",
+    )
+    targets.add_argument("--pseudo-root", type=Path, default=DEFAULT_PSEUDO, help="root of the pseudo-depth caches")
     targets.set_defaults(handler=run_targets)
 
     cache = subparsers.add_parser("cache", help="extract frozen teacher features for one or more arms")
@@ -638,6 +697,11 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--arms", nargs="+", default=["A", "C", "D"], help="arms judged on the target grid")
     fit.add_argument("--kinds", nargs="+", default=["state", "delta"], choices=["state", "delta"])
     fit.add_argument("--grid", type=int, nargs=2, default=[16, 16])
+    fit.add_argument(
+        "--estimator",
+        default=None,
+        help="fit against this estimator's pseudo targets instead of the simulator ones",
+    )
     fit.add_argument("--seeds", type=int, nargs="+", default=list(geo_probe.DEFAULT_SEEDS))
     fit.add_argument("--lr-grid", type=float, nargs="+", default=list(geo_probe.DEFAULT_LR_GRID))
     fit.add_argument("--epochs", type=int, nargs="+", default=list(geo_probe.DEFAULT_EPOCHS))

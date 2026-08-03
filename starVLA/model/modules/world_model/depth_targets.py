@@ -25,6 +25,16 @@ import torch.nn.functional as F
 
 TARGET_TYPE_METRIC = "sim_metric"
 TARGET_TYPE_PSEUDO = "pseudo_relative"
+# A monocular estimator that predicts metres rather than an arbitrary affine scale (S4's
+# `DA3METRIC-LARGE`, `DA3NESTED-GIANT-LARGE`, `Metric-Video-Depth-Anything-Large`). It shares the
+# metric pipeline and units, so `evaluate` reports the metric class for it, but it is a *distinct*
+# label from `TARGET_TYPE_METRIC`: the numbers come from a network, not from the simulator's depth
+# buffer, and AGENTS.md section 7 forbids letting the two look alike.
+TARGET_TYPE_PSEUDO_METRIC = "pseudo_metric"
+
+# Target types whose values are log metres, i.e. for which AbsRel / RMSE / delta1 have a referent.
+METRIC_TARGET_TYPES = frozenset({TARGET_TYPE_METRIC, TARGET_TYPE_PSEUDO_METRIC})
+TARGET_TYPES = METRIC_TARGET_TYPES | {TARGET_TYPE_PSEUDO}
 
 UNITS_LOG_METER = "log_meter"
 UNITS_LOG_METER_DELTA = "log_meter_delta"
@@ -105,6 +115,7 @@ def log_metric_depth(
     valid: Optional[torch.Tensor] = None,
     d_min: float = DEFAULT_D_MIN,
     d_max: float = DEFAULT_D_MAX,
+    target_type: str = TARGET_TYPE_METRIC,
 ) -> DepthTarget:
     """`D~ = log(clip(D, d_min, d_max))` on metric depth (implementation-plan section 6).
 
@@ -113,6 +124,8 @@ def log_metric_depth(
         valid: optional recorded sensor mask, broadcast-compatible with `depth_m`.
         d_min: lower clip bound in metres, must be > 0 so the log is defined.
         d_max: upper clip bound in metres.
+        target_type: which metric source the metres came from; the maths is identical for the
+            simulator buffer and for a metric estimator, only the provenance label differs.
 
     Returns:
         Log-depth target in `UNITS_LOG_METER`; invalid positions are zero.
@@ -121,11 +134,13 @@ def log_metric_depth(
         raise ValueError(f"d_min must be positive for a log target, got {d_min}")
     if not d_max > d_min:
         raise ValueError(f"d_max ({d_max}) must exceed d_min ({d_min})")
+    if target_type not in METRIC_TARGET_TYPES:
+        raise ValueError(f"target_type {target_type!r} is not one of the metric types {sorted(METRIC_TARGET_TYPES)}")
 
     mask = sensor_valid_mask(depth_m, valid)
     clipped = torch.clamp(torch.nan_to_num(depth_m, nan=d_min, posinf=d_max, neginf=d_min), d_min, d_max)
     values = torch.where(mask, torch.log(clipped), torch.zeros_like(clipped))
-    return DepthTarget(values=values, mask=mask, target_type=TARGET_TYPE_METRIC, units=UNITS_LOG_METER)
+    return DepthTarget(values=values, mask=mask, target_type=target_type, units=UNITS_LOG_METER)
 
 
 def normalize_clip_level(
@@ -245,6 +260,7 @@ def build_metric_delta_targets(
     grid: Optional[Tuple[int, int]] = None,
     d_min: float = DEFAULT_D_MIN,
     d_max: float = DEFAULT_D_MAX,
+    target_type: str = TARGET_TYPE_METRIC,
 ) -> Tuple[DepthTarget, DepthTarget]:
     """The default metric pipeline: log-clip, tubelet-align, optionally pool, then difference.
 
@@ -253,12 +269,15 @@ def build_metric_delta_targets(
         valid: optional recorded sensor mask of the same shape.
         tubelet_size: teacher tubelet length; each tubelet keeps its last frame.
         grid: token grid to pool onto, or None to keep the dense resolution.
+        target_type: `TARGET_TYPE_METRIC` for the simulator buffer, `TARGET_TYPE_PSEUDO_METRIC` for a
+            metric estimator. Estimator targets must go through this same call rather than a parallel
+            implementation, so the two only ever differ by their label.
 
     Returns:
         `(states, deltas)`: `[B, Tp, V, 1, h, w]` log-depth states and `[B, Tp - 1, V, 1, h, w]`
         adjacent deltas.
     """
-    states = log_metric_depth(cache_depth, valid=valid, d_min=d_min, d_max=d_max)
+    states = log_metric_depth(cache_depth, valid=valid, d_min=d_min, d_max=d_max, target_type=target_type)
     aligned = DepthTarget(
         values=tubelet_last_frame(states.values, tubelet_size),
         mask=tubelet_last_frame(states.mask, tubelet_size),

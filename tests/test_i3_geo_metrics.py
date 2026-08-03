@@ -19,7 +19,14 @@ import math
 import pytest
 import torch
 
-from starVLA.model.modules.world_model.depth_targets import TARGET_TYPE_METRIC, TARGET_TYPE_PSEUDO
+from starVLA.model.modules.world_model import depth_targets
+from starVLA.model.modules.world_model.depth_targets import (
+    METRIC_TARGET_TYPES,
+    TARGET_TYPE_METRIC,
+    TARGET_TYPE_PSEUDO,
+    TARGET_TYPE_PSEUDO_METRIC,
+    TARGET_TYPES,
+)
 from starVLA.probes import geo_metrics, geo_probe
 
 SHAPE = (2, 4, 2, 1, 4, 4)  # [N, Tp, V, 1, h, w], the layout depth_targets emits
@@ -182,6 +189,44 @@ def test_a_pseudo_target_reports_no_metric_class_at_all():
 
     metric = geo_metrics.evaluate(target, target, _all_valid(), target_type=TARGET_TYPE_METRIC)
     assert metric.metric and metric.relative
+
+
+def test_a_metric_estimator_target_gets_the_metric_class_but_keeps_its_own_label():
+    """S4's estimators predict metres, so AbsRel means something -- yet they are not the simulator."""
+    target = _targets()
+    pseudo_metric = geo_metrics.evaluate(target, target, _all_valid(), target_type=TARGET_TYPE_PSEUDO_METRIC)
+    assert pseudo_metric.metric, "log metres from an estimator still have a metric referent"
+    assert pseudo_metric.target_type == TARGET_TYPE_PSEUDO_METRIC
+    assert pseudo_metric.target_type != TARGET_TYPE_METRIC, "estimator output must not look like sim GT"
+
+    simulator = geo_metrics.evaluate(target, target, _all_valid(), target_type=TARGET_TYPE_METRIC)
+    assert set(pseudo_metric.metric) == set(simulator.metric), "same metric names, so the two are comparable"
+
+
+def test_the_metric_class_is_gated_on_units_not_on_one_string():
+    """The gate must be `in METRIC_TARGET_TYPES`; an equality check would have silently excluded S4."""
+    assert TARGET_TYPE_METRIC in METRIC_TARGET_TYPES
+    assert TARGET_TYPE_PSEUDO_METRIC in METRIC_TARGET_TYPES
+    assert TARGET_TYPE_PSEUDO not in METRIC_TARGET_TYPES
+    assert METRIC_TARGET_TYPES < TARGET_TYPES
+
+
+def test_a_relative_target_type_cannot_reach_the_metric_pipeline():
+    """`log_metric_depth` produces log metres, so labelling its output relative is a contradiction."""
+    with pytest.raises(ValueError, match="not one of the metric types"):
+        depth_targets.log_metric_depth(torch.full(SHAPE, 0.5), target_type=TARGET_TYPE_PSEUDO)
+
+
+def test_the_estimator_and_simulator_paths_are_the_same_maths():
+    """Only the label may differ: a parallel implementation for estimators would be unauditable."""
+    depth = torch.rand(2, 2, 4, 1, 4, 4) * 2.0 + 0.1  # [B, V, T, 1, H, W] metres
+    simulator = depth_targets.build_metric_delta_targets(depth, target_type=TARGET_TYPE_METRIC)
+    estimator = depth_targets.build_metric_delta_targets(depth, target_type=TARGET_TYPE_PSEUDO_METRIC)
+    for from_sim, from_estimator in zip(simulator, estimator, strict=True):
+        assert torch.equal(from_sim.values, from_estimator.values)
+        assert torch.equal(from_sim.mask, from_estimator.mask)
+        assert from_sim.units == from_estimator.units
+        assert from_sim.target_type != from_estimator.target_type
 
 
 def test_geo_metrics_offers_no_combined_scalar():

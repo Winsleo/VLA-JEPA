@@ -30,8 +30,8 @@ from typing import Dict, Optional, Tuple
 import torch
 
 from starVLA.model.modules.world_model.depth_targets import (
-    TARGET_TYPE_METRIC,
-    TARGET_TYPE_PSEUDO,
+    METRIC_TARGET_TYPES,
+    TARGET_TYPES,
 )
 
 # delta1 is the standard 1.25 depth-accuracy threshold.
@@ -283,9 +283,10 @@ def evaluate(
 
     A pseudo-relative target is normalised to MAD units, where AbsRel and RMSE in "metres" would be
     numbers without a referent, so the metric class is left empty for it rather than computed and
-    labelled misleadingly.
+    labelled misleadingly. A *metric* estimator's target is in log metres and therefore does get the
+    metric class -- gated on `METRIC_TARGET_TYPES`, i.e. on the units, never on the string itself.
     """
-    if target_type not in (TARGET_TYPE_METRIC, TARGET_TYPE_PSEUDO):
+    if target_type not in TARGET_TYPES:
         raise ValueError(f"unknown target_type {target_type!r}")
 
     shared = {
@@ -295,7 +296,7 @@ def evaluate(
     }
     metric = (
         metric_depth_metrics(pred_states, target_states, states_mask, **shared)
-        if target_type == TARGET_TYPE_METRIC
+        if target_type in METRIC_TARGET_TYPES
         else {}
     )
     relative = relative_depth_metrics(pred_states, target_states, states_mask, **shared)

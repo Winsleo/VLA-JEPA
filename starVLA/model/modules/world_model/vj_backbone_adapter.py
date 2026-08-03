@@ -11,6 +11,14 @@ NOT an nn.Module on purpose: the encoder stays a direct submodule of the framewo
 published checkpoints keep loading with `strict=True` under their existing `vj_encoder.*` keys.
 Wrapping it in a module would either re-prefix or double-register those parameters.
 
+Known upstream defect, preserved by default (`docs/provenance/upstream-conflicts.md`): upstream fuses
+the two camera views with `torch.cat(torch.chunk(features, chunks=V, dim=0), dim=2)` after flattening
+`[B, V, ...]` into `[B*V, ...]`. Views are the *minor* axis of that flatten, while `chunk` cuts the
+batch axis into contiguous halves, so for `B > 1` a row receives one view from its own clip and
+another from a different clip. It is exact at `B == 1`. `correct_view_fusion=True` selects the
+per-clip pairing; the default is `False` because the I2 parity goldens were recorded at `BATCH_SIZE=2`
+and therefore encode upstream's behaviour.
+
 Gradient firewall (AGENTS.md section 6): the encoder is put in `eval()` and
 `requires_grad_(False)` here, and `enforce_frozen()` is re-applied by `VLA_JEPA.train()`.
 Numerically this is an identity operation on the pinned checkpoint -- its dropout and
@@ -65,6 +73,7 @@ class VJBackboneAdapter:
         num_frames: int,
         resampler: Optional[SpatialTokenResampler] = None,
         input_size: Optional[int] = None,
+        correct_view_fusion: bool = False,
     ) -> None:
         """Bind a frozen encoder to the geometry its features will be read with.
 
@@ -77,9 +86,13 @@ class VJBackboneAdapter:
                 input tensor, so the same weights also run natively at 256. `input_size` only
                 *declares* which resolution the caller feeds; `encode_video`'s shape assertion is
                 what verifies the processor actually delivers it.
+            correct_view_fusion: pair each clip with its own views. `False` reproduces upstream's
+                fusion, which is only correct at `batch_size == 1`, and is the default so that the
+                I2 golden losses stay bitwise reproducible.
         """
         self.encoder = encoder
         self.processor = processor
+        self.correct_view_fusion = correct_view_fusion
 
         config = encoder.config
         self.image_size: int = resolve_input_size(config) if input_size is None else input_size
@@ -148,7 +161,7 @@ class VJBackboneAdapter:
 
         with torch.no_grad():
             features = self.encoder.get_vision_features(pixel_values_videos=pixel_values)
-            features = torch.cat(torch.chunk(features, chunks=num_views, dim=0), dim=2)
+            features = self._fuse_views(features, batch_size, num_views)
             if self.resampler is not None:
                 # After fusion, not before: the resampler leaves the channel axis alone, so the two
                 # orders are equal (pinned by a test), and pooling once is the cheaper of them.
@@ -162,6 +175,22 @@ class VJBackboneAdapter:
         if tuple(features.shape) != expected:
             raise AssertionError(f"teacher features {tuple(features.shape)}, geometry expects {expected}")
         return features
+
+    def _fuse_views(self, features: torch.Tensor, batch_size: int, num_views: int) -> torch.Tensor:
+        """Concatenate each clip's views on the feature axis: [B*V, tokens, D] -> [B, tokens, V*D].
+
+        Two implementations, because the pinned upstream one is wrong for `B > 1` (see
+        `correct_view_fusion`). Both are identical at `B == 1`, which is pinned by a test.
+        """
+        if self.correct_view_fusion:
+            # `flat` was built as [B, V, ...] -> [B*V, ...], so V is the minor axis: split it back out
+            # before moving it onto the channel axis. View v then occupies channels [v*D, (v+1)*D).
+            unpacked = features.reshape(batch_size, num_views, features.shape[1], features.shape[2])
+            return unpacked.permute(0, 2, 1, 3).reshape(batch_size, features.shape[1], num_views * features.shape[2])
+        # Upstream: `chunk` cuts the batch axis into V contiguous halves, but V is the minor axis of
+        # the flatten above, so for B > 1 row b receives one view from clip b and another from a
+        # different clip entirely. Kept as the default so I2 parity stays bitwise.
+        return torch.cat(torch.chunk(features, chunks=num_views, dim=0), dim=2)
 
     def split_teacher_forcing(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Split fused features into the predictor input and its teacher-forced target.

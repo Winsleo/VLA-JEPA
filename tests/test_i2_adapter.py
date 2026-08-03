@@ -123,6 +123,78 @@ def test_views_are_concatenated_in_order_on_the_feature_axis(adapter, cfg):
 
 
 # --------------------------------------------------------------------------------------
+# batched fusion: upstream's is only correct at batch size 1
+# --------------------------------------------------------------------------------------
+
+def _batch(cfg, clip_seeds):
+    """[B, V, T, C, H, W] with both views of a clip identical, so correct fusion is checkable exactly.
+
+    Per-clip identical views make the invariant bitwise: view v of clip b must land in channel block
+    v, so the two blocks of a row are equal exactly when the row was paired with its own clip.
+    """
+    return np.concatenate([_clips(cfg, (seed,) * NUM_VIEWS) for seed in clip_seeds], axis=0)
+
+
+@pytest.fixture
+def corrected(adapter):
+    """The same adapter with per-clip view pairing, restored afterwards (the fixture is module-wide)."""
+    adapter.correct_view_fusion = True
+    yield adapter
+    adapter.correct_view_fusion = False
+
+
+def test_the_two_fusions_agree_at_batch_size_one(adapter, cfg):
+    """The pinned path is exact at batch 1, which is why the defect never showed up in I2."""
+    clips = _clips(cfg, (1, 2))
+    upstream = adapter.encode_video(clips)
+    adapter.correct_view_fusion = True
+    try:
+        assert torch.equal(upstream, adapter.encode_video(clips))
+    finally:
+        adapter.correct_view_fusion = False
+
+
+def test_the_default_fusion_mispairs_clips_and_views_above_batch_one(adapter, cfg):
+    """Pins the upstream defect rather than hiding it: identical views per clip still fuse unequal.
+
+    `chunk(dim=0)` cuts the batch axis in half, but views are the minor axis of the `[B, V] -> [B*V]`
+    flatten, so row b gets one view from clip b and one from another clip entirely.
+    """
+    dim = adapter.hidden_size
+    features = adapter.encode_video(_batch(cfg, (1, 2)))
+    assert features.shape[0] == 2
+    for row in range(2):
+        assert not torch.equal(features[row, :, :dim], features[row, :, dim:]), (
+            f"row {row} fused two equal views: upstream's defect is gone, so this test is stale"
+        )
+
+
+def test_correct_view_fusion_pairs_every_row_with_its_own_clip(corrected, cfg):
+    dim = corrected.hidden_size
+    features = corrected.encode_video(_batch(cfg, (1, 2, 3)))
+    assert features.shape[0] == 3
+    for row in range(3):
+        assert torch.equal(features[row, :, :dim], features[row, :, dim:])
+    # Distinct clips must still be distinct rows: equal blocks alone would also pass on a constant.
+    assert not torch.equal(features[0], features[1])
+
+
+def test_correct_view_fusion_reproduces_per_clip_forwards(corrected, cfg):
+    """End-to-end statement of the same claim, against clips whose two views really differ.
+
+    `allclose` rather than `equal`: batching changes the encoder's GEMM shapes, so the two runs
+    differ in the low bits. The mispairing it rules out is three orders of magnitude larger.
+    """
+    batch = np.concatenate([_clips(cfg, seeds) for seeds in ((1, 2), (3, 4), (5, 6))], axis=0)
+    batched = corrected.encode_video(batch)
+    per_clip = torch.cat([corrected.encode_video(batch[row : row + 1]) for row in range(3)], dim=0)
+    assert torch.allclose(batched, per_clip, atol=1e-3, rtol=0.0)
+
+    corrected.correct_view_fusion = False
+    assert (corrected.encode_video(batch) - per_clip).abs().max() > 1.0
+
+
+# --------------------------------------------------------------------------------------
 # teacher forcing split
 # --------------------------------------------------------------------------------------
 

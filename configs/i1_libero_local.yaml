@@ -55,6 +55,9 @@ framework:
     embodied_action_token: <|embodied_action|>
     num_embodied_action_tokens_per_instruction: 32
     num_frames: 8
+    # Upstream pairs clips with the wrong views when batch > 1; false keeps that behaviour so the
+    # I2 parity goldens stay bitwise. Turn on for I4, where wm_loss is the studied signal.
+    correct_view_fusion: false
   reduce_in_full_precision: true
 datasets:
   vla_data:

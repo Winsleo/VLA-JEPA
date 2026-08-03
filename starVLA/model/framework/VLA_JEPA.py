@@ -88,6 +88,9 @@ class VLA_JEPA(baseframework):
             encoder=self.vj_encoder,
             processor=self.vj_processor,
             num_frames=self.config.framework.vj2_model.num_frames,
+            # Off by default: upstream's view fusion is wrong for batch > 1, and the I2 goldens
+            # encode it. See the adapter's docstring and docs/provenance/upstream-conflicts.md.
+            correct_view_fusion=bool(self.config.framework.vj2_model.get("correct_view_fusion", False)),
         )
 
         # One predictor token per teacher token: the geometry comes from the backbone adapter, and

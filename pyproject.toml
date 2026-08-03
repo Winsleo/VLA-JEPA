@@ -93,3 +93,8 @@ ignore = ["F722"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
+
+[tool.ruff.lint.isort]
+# tests/parity_probe.py is this repository's own test helper, not a published package. Without this
+# ruff sorts it into the third-party block, away from the starVLA imports it belongs with.
+known-first-party = ["parity_probe"]

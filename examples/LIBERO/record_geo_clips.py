@@ -11,13 +11,17 @@ on-policy distribution the evaluation measures. The loop below mirrors `eval_lib
 `eval_libero.py` is the validated I1/I2 evaluation entry point and must not be restructured; the
 parts that can be shared without touching its rollout loop are imported.
 
-Output layout, one directory per episode, one compressed npz per clip (outside the repository):
+Output layout, one root per clip stride, one directory per episode, one npz per clip (outside the
+repository). A stride is its own root because `depth_cache_dataset.load_manifest` discovers clips by
+globbing `manifest_*.jsonl` at the root it is given, so separate roots are what keep clips covering
+different real durations from being read as one dataset:
 
-    <out>/<suite>/<task_id>_<slug>/ep<idx>/clip<k>.npz   rgb / depth_m / valid / extrinsics / actions
-    <out>/<suite>/<task_id>_<slug>/ep<idx>/meta.json     recording contract + provenance
-    <out>/manifest_<suite>.jsonl                         one line per clip (one file per process)
+    <out>/s<stride>/<suite>/<task_id>_<slug>/ep<idx>/clip<k>.npz  rgb / depth_m / valid / extrinsics / actions
+    <out>/s<stride>/<suite>/<task_id>_<slug>/ep<idx>/meta.json    recording contract + provenance
+    <out>/s<stride>/manifest_<suite>.jsonl                        one line per clip (one file per process)
 """
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -50,11 +54,14 @@ from examples.LIBERO.geo_clip_contract import (
     TARGET_TYPE,
     VALID_RULE,
     VIEW_NAMES,
+    checked_strides,
+    clip_span,
     clip_starts,
     decode_action,
     depth_valid_mask,
     rotate180,
     split_for_episode,
+    stride_root,
 )
 from examples.LIBERO.model2libero_interface import M1Inference
 
@@ -76,6 +83,10 @@ class Args:
     out_path: str = "geo_clips"
     clip_frames: int = 8  # teacher clip length (framework.vj2_model.num_frames)
     clips_per_episode: int = 8
+    # Frame strides to cut clips at, one dataset root each. A clip always holds `clip_frames` frames;
+    # a wider stride makes it cover more real time, which is the interval a depth transition target
+    # spans. One rollout can serve every stride, so the sweep costs disk rather than a second pass.
+    clip_strides: List[int] = dataclasses.field(default_factory=lambda: [CLIP_STRIDE])
     # Episode index ranges per split, so every task appears in all three splits (in-domain probe)
     # and no frame is shared across them: [0, num_train) train, then num_val val, the rest test.
     num_train_episodes: int = 3
@@ -119,9 +130,11 @@ def record_geo_clips(args: Args) -> None:
 
     task_suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
 
-    out_root = pathlib.Path(args.out_path)
-    out_root.mkdir(parents=True, exist_ok=True)
-    manifest_path = out_root / f"manifest_{args.task_suite_name}.jsonl"
+    strides = checked_strides(args.clip_strides)
+    roots = {stride: stride_root(args.out_path, stride) for stride in strides}
+    manifest_paths = {stride: root / f"manifest_{args.task_suite_name}.jsonl" for stride, root in roots.items()}
+    for root in roots.values():
+        root.mkdir(parents=True, exist_ok=True)
     provenance = {
         "recorder_version": RECORDER_VERSION,
         "vla_jepa_commit": _git_commit(pathlib.Path(__file__).resolve().parents[2]),
@@ -136,7 +149,10 @@ def record_geo_clips(args: Args) -> None:
     )
 
     total_clips = 0
-    with manifest_path.open("w") as manifest:
+    # One rollout feeds every stride, so the sweep costs disk rather than a second pass through the
+    # simulator; the manifests are therefore all open at once, one per stride.
+    with contextlib.ExitStack() as stack:
+        manifests = {stride: stack.enter_context(path.open("w")) for stride, path in manifest_paths.items()}
         for task_id in tqdm.tqdm(range(task_suite.n_tasks)):
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
@@ -149,7 +165,10 @@ def record_geo_clips(args: Args) -> None:
                 view: get_camera_intrinsic_matrix(env.sim, view, LIBERO_ENV_RESOLUTION, LIBERO_ENV_RESOLUTION).tolist()
                 for view in VIEW_NAMES
             }
-            task_dir = out_root / args.task_suite_name / f"{task_id:02d}_{short_name(task.name)}"
+            task_dirs = {
+                stride: root / args.task_suite_name / f"{task_id:02d}_{short_name(task.name)}"
+                for stride, root in roots.items()
+            }
 
             for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
                 model.reset(task_description=task_description)
@@ -198,88 +217,100 @@ def record_geo_clips(args: Args) -> None:
                     t += 1
                     step += 1
 
-                starts = clip_starts(len(rgb_frames), args.clip_frames, args.clips_per_episode)
-                if not starts:
-                    logging.warning(
-                        f"task {task_id} episode {episode_idx}: only {len(rgb_frames)} frames, "
-                        f"fewer than clip_frames={args.clip_frames}; no clip written"
-                    )
-                    continue
-
-                episode_dir = task_dir / f"ep{episode_idx:02d}"
-                episode_dir.mkdir(parents=True, exist_ok=True)
+                # The split is a property of the episode, not of a stride, so every stride variant of
+                # this episode lands in the same split and no frame crosses the split boundary.
                 split = split_for_episode(episode_idx, args.num_train_episodes, args.num_val_episodes)
 
-                for clip_index, start in enumerate(starts):
-                    stop = start + args.clip_frames
-                    depth_clip = np.stack(depth_frames[start:stop], axis=0)
-                    valid_clip = depth_valid_mask(depth_clip, z_near, z_far)
-                    clip_path = episode_dir / f"clip{clip_index:02d}.npz"
-                    np.savez_compressed(
-                        clip_path,
-                        rgb=np.stack(rgb_frames[start:stop], axis=0),
-                        depth_m=depth_clip,
-                        valid=valid_clip,
-                        extrinsics=np.stack(extrinsic_frames[start:stop], axis=0),
-                        actions=np.stack(action_frames[start:stop], axis=0),
-                    )
-                    manifest.write(
-                        json.dumps(
-                            {
-                                "path": str(clip_path.relative_to(out_root)),
-                                "suite": args.task_suite_name,
-                                "task_id": task_id,
-                                "episode_index": episode_idx,
-                                "clip_index": clip_index,
-                                "start": start,
-                                "split": split,
-                                "target_type": TARGET_TYPE,
-                                "success": bool(done),
-                                "valid_fraction": float(valid_clip.mean()),
-                            }
+                for stride in strides:
+                    span = clip_span(args.clip_frames, stride)
+                    starts = clip_starts(len(rgb_frames), args.clip_frames, args.clips_per_episode, stride)
+                    if not starts:
+                        logging.warning(
+                            f"task {task_id} episode {episode_idx} stride {stride}: only "
+                            f"{len(rgb_frames)} frames, fewer than the {span}-frame clip span; no clip written"
                         )
-                        + "\n"
-                    )
-                    manifest.flush()
-                    total_clips += 1
+                        continue
 
-                meta = {
-                    "target_type": TARGET_TYPE,
-                    "depth_units": "meter",
-                    "z_near": z_near,
-                    "z_far": z_far,
-                    "mujoco_extent": extent,
-                    "valid_rule": VALID_RULE,
-                    "suite": args.task_suite_name,
-                    "task_id": task_id,
-                    "task_name": task.name,
-                    "task_description": str(task_description),
-                    "episode_index": episode_idx,
-                    "init_state_index": episode_idx,
-                    "seed": args.seed,
-                    "split": split,
-                    "success": bool(done),
-                    "num_steps_wait": args.num_steps_wait,
-                    "max_steps": max_steps,
-                    "recorded_frames": len(rgb_frames),
-                    "resolution": LIBERO_ENV_RESOLUTION,
-                    "views": list(VIEW_NAMES),
-                    "pixel_convention": PIXEL_CONVENTION,
-                    "clip_frames": args.clip_frames,
-                    "clip_stride": CLIP_STRIDE,
-                    "clip_starts": starts,
-                    "intrinsics": intrinsics,
-                    "provenance": provenance,
-                }
-                (episode_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-                logging.info(
-                    f"task {task_id} episode {episode_idx} ({split}): "
-                    f"{len(rgb_frames)} frames, {len(starts)} clips, success={done}"
-                )
+                    episode_dir = task_dirs[stride] / f"ep{episode_idx:02d}"
+                    episode_dir.mkdir(parents=True, exist_ok=True)
+                    manifest = manifests[stride]
+
+                    for clip_index, start in enumerate(starts):
+                        window = slice(start, start + span, stride)
+                        depth_clip = np.stack(depth_frames[window], axis=0)
+                        valid_clip = depth_valid_mask(depth_clip, z_near, z_far)
+                        clip_path = episode_dir / f"clip{clip_index:02d}.npz"
+                        np.savez_compressed(
+                            clip_path,
+                            rgb=np.stack(rgb_frames[window], axis=0),
+                            depth_m=depth_clip,
+                            valid=valid_clip,
+                            extrinsics=np.stack(extrinsic_frames[window], axis=0),
+                            # The actions in between are dropped along with the frames: at stride > 1
+                            # these are the actions at the sampled steps, not the whole transition.
+                            actions=np.stack(action_frames[window], axis=0),
+                        )
+                        manifest.write(
+                            json.dumps(
+                                {
+                                    "path": str(clip_path.relative_to(roots[stride])),
+                                    "suite": args.task_suite_name,
+                                    "task_id": task_id,
+                                    "episode_index": episode_idx,
+                                    "clip_index": clip_index,
+                                    "start": start,
+                                    "clip_stride": stride,
+                                    "span": span,
+                                    "split": split,
+                                    "target_type": TARGET_TYPE,
+                                    "success": bool(done),
+                                    "valid_fraction": float(valid_clip.mean()),
+                                }
+                            )
+                            + "\n"
+                        )
+                        manifest.flush()
+                        total_clips += 1
+
+                    meta = {
+                        "target_type": TARGET_TYPE,
+                        "depth_units": "meter",
+                        "z_near": z_near,
+                        "z_far": z_far,
+                        "mujoco_extent": extent,
+                        "valid_rule": VALID_RULE,
+                        "suite": args.task_suite_name,
+                        "task_id": task_id,
+                        "task_name": task.name,
+                        "task_description": str(task_description),
+                        "episode_index": episode_idx,
+                        "init_state_index": episode_idx,
+                        "seed": args.seed,
+                        "split": split,
+                        "success": bool(done),
+                        "num_steps_wait": args.num_steps_wait,
+                        "max_steps": max_steps,
+                        "recorded_frames": len(rgb_frames),
+                        "resolution": LIBERO_ENV_RESOLUTION,
+                        "views": list(VIEW_NAMES),
+                        "pixel_convention": PIXEL_CONVENTION,
+                        "clip_frames": args.clip_frames,
+                        "clip_stride": stride,
+                        "span": span,
+                        "clip_starts": starts,
+                        "intrinsics": intrinsics,
+                        "provenance": provenance,
+                    }
+                    (episode_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+                    logging.info(
+                        f"task {task_id} episode {episode_idx} ({split}) stride {stride}: "
+                        f"{len(rgb_frames)} frames, {len(starts)} clips of span {span}, success={done}"
+                    )
 
             env.close()
 
-    logging.info(f"Wrote {total_clips} clips and {manifest_path}")
+    written = ", ".join(str(path) for path in manifest_paths.values())
+    logging.info(f"Wrote {total_clips} clips and {written}")
 
 
 if __name__ == "__main__":

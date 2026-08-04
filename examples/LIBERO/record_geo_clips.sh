@@ -4,9 +4,13 @@
 # Same two-process layout as eval_libero.sh (policy server in the pinned training env, simulator in
 # envs/libero_py310), one process pair per suite so each suite writes its own manifest file.
 #
-# Overridable: SUITES, NUM_TRIALS, SEED, EVAL_GPUS, GEO_CLIPS_OUT, CLIPS_PER_EPISODE.
+# Overridable: SUITES, NUM_TRIALS, SEED, EVAL_GPUS, GEO_CLIPS_OUT, CLIPS_PER_EPISODE, CLIP_STRIDES,
+# SEQUENTIAL.
 # Smoke run before the full pass:
 #   SUITES=libero_goal NUM_TRIALS=1 EVAL_GPUS=0 GEO_CLIPS_OUT=/tmp/geo_clips_smoke bash examples/LIBERO/record_geo_clips.sh
+# All four stride variants of the delta-interval sweep, from a single pass through the simulator:
+#   CLIP_STRIDES="1 2 4 8" GEO_CLIPS_OUT=/vepfs/wangshilong/data/dynaweave/i3_geo_clips_sweep \
+#   bash examples/LIBERO/record_geo_clips.sh
 
 export PYTHONDONTWRITEBYTECODE=1
 export LIBERO_HOME=/vepfs/wangshilong/benchmarks/LIBERO
@@ -24,10 +28,18 @@ host="127.0.0.1"
 base_port=15183
 num_trials_per_task=${NUM_TRIALS:-5}
 clips_per_episode=${CLIPS_PER_EPISODE:-8}
+# Frame strides to cut clips at; each becomes its own dataset root under ${out_root}/s<stride>. One
+# rollout serves all of them, so widening this list costs disk and not simulator time.
+clip_strides=${CLIP_STRIDES:-1}
 with_state="true"
 seed=${SEED:-7}
 out_root=${GEO_CLIPS_OUT:-/vepfs/wangshilong/data/dynaweave/i3_geo_clips}
 IFS=',' read -r -a eval_gpus <<< "${EVAL_GPUS:-4,5,6,7}"
+
+# Suites otherwise run concurrently, one per GPU. On a single-GPU machine that would co-locate every
+# policy server and every simulator on one device, so there the default is one suite at a time, with
+# each suite's server released before the next starts.
+sequential=${SEQUENTIAL:-$([ ${#eval_gpus[@]} -eq 1 ] && echo 1 || echo 0)}
 
 mkdir -p "${out_root}"
 index=0
@@ -45,17 +57,26 @@ do
         --port ${port} \
         --use_bf16 \
         --cuda ${cuda} > "${out_root}/server_${task_suite_name}.log" 2>&1 &
+    server_pid=$!
 
-    ${sim_python} ./examples/LIBERO/record_geo_clips.py \
-        --args.pretrained-path ${your_ckpt} \
-        --args.host "$host" \
-        --args.port ${port} \
-        --args.task-suite-name "$task_suite_name" \
-        --args.num-trials-per-task "$num_trials_per_task" \
-        --args.clips-per-episode "$clips_per_episode" \
-        --args.out-path "$out_root" \
-        --args.with_state "$with_state" \
-        --args.seed "$seed" > "${out_root}/record_${task_suite_name}.log" 2>&1 &
+    recorder=(${sim_python} ./examples/LIBERO/record_geo_clips.py
+        --args.pretrained-path ${your_ckpt}
+        --args.host "$host"
+        --args.port ${port}
+        --args.task-suite-name "$task_suite_name"
+        --args.num-trials-per-task "$num_trials_per_task"
+        --args.clips-per-episode "$clips_per_episode"
+        --args.clip-strides ${clip_strides}
+        --args.out-path "$out_root"
+        --args.with_state "$with_state"
+        --args.seed "$seed")
+
+    if [ "${sequential}" = "1" ]; then
+        "${recorder[@]}" > "${out_root}/record_${task_suite_name}.log" 2>&1
+        kill "${server_pid}" 2>/dev/null || true
+    else
+        "${recorder[@]}" > "${out_root}/record_${task_suite_name}.log" 2>&1 &
+    fi
 done
 
 # As in eval_libero.sh, both processes stay in the background: follow ${out_root}/record_*.log for

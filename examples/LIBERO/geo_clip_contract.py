@@ -6,7 +6,8 @@ is therefore framework-free so `tests/test_i3_geo_clip_recorder.py` can pin the 
 without a simulator - the same split of responsibilities `libero_gripper_command` already uses.
 """
 
-from typing import Dict, List, Tuple
+import pathlib
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -79,17 +80,51 @@ def split_for_episode(episode_idx: int, num_train: int, num_val: int) -> str:
     return "test"
 
 
-def clip_starts(num_frames: int, clip_frames: int, max_clips: int) -> List[int]:
+def clip_span(clip_frames: int, stride: int = CLIP_STRIDE) -> int:
+    """Episode frames one clip reaches across: `clip_frames` samples `stride` apart.
+
+    The clip still holds `clip_frames` frames whatever the stride; what grows is the real time it
+    covers, which is the interval a depth transition target spans (`scripts/run_geo_probes.py`).
+    """
+    return (clip_frames - 1) * stride + 1
+
+
+def clip_starts(num_frames: int, clip_frames: int, max_clips: int, stride: int = CLIP_STRIDE) -> List[int]:
     """Evenly spaced, deduplicated clip start indices covering the whole episode.
 
     Spreading the starts (rather than taking the first N) keeps the late reach/grasp phase in the
     cache. Deterministic by construction: no sampling.
+
+    The bound is the clip's `clip_span`, not its frame count: a strided clip ends at
+    `start + span - 1`, so bounding by `clip_frames` would run off the end of the episode. An episode
+    too short to hold one strided clip yields no start rather than a truncated one.
     """
-    if num_frames < clip_frames or max_clips < 1:
+    span = clip_span(clip_frames, stride)
+    if num_frames < span or max_clips < 1:
         return []
-    last_start = num_frames - clip_frames
+    last_start = num_frames - span
     raw = np.linspace(0, last_start, num=min(max_clips, last_start + 1))
     return sorted({round(float(value)) for value in raw})
+
+
+def checked_strides(requested: Sequence[int]) -> List[int]:
+    """Deduplicated, ascending recording strides; a stride below 1 would reverse or freeze time."""
+    if not requested:
+        raise ValueError("clip_strides is empty: at least one stride must be recorded")
+    if any(stride < 1 for stride in requested):
+        raise ValueError(f"clip_strides must all be >= 1, got {list(requested)}")
+    return sorted(set(requested))
+
+
+def stride_root(out_path: str, stride: int) -> pathlib.Path:
+    """The dataset root holding the clips cut at one stride.
+
+    Nested unconditionally, including for the default stride 1: `depth_cache_dataset.load_manifest`
+    discovers clips by globbing `manifest_*.jsonl` at the root it is given, so one root per stride is
+    what keeps clips covering different real durations from being read as one dataset. Applying it to
+    every stride rather than only to the wide ones keeps one rule and makes a cache self-describing.
+    """
+    return pathlib.Path(out_path) / f"s{stride}"
 
 
 def depth_valid_mask(depth_m: np.ndarray, z_near: float, z_far: float) -> np.ndarray:

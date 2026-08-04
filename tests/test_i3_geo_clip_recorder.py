@@ -6,6 +6,10 @@ pure parts of the recorder - clip start selection, split assignment, the 180 deg
 to RGB and depth alike, and the sensor-range mask - which together decide whether the cached clips
 are reproducible (I3 gate condition b) and whether invalid pixels stay countable (condition c).
 
+The stride axis of the delta-interval sweep is pinned here too: a clip holds `clip_frames` frames
+whatever the stride, so what a stride changes is the real time the clip covers, and a start selected
+against the frame count instead of that span would read past the end of the episode.
+
 Pure logic, CPU-only, no simulator: `geo_clip_contract.py` holds everything that does not need
 `libero` / `robosuite`, which are only installed in the simulator environment.
 Run:  pytest tests/test_i3_geo_clip_recorder.py -v
@@ -22,15 +26,20 @@ from examples.LIBERO.geo_clip_contract import (
     MAX_STEPS_BY_SUITE,
     TARGET_TYPE,
     VIEW_NAMES,
+    checked_strides,
+    clip_span,
     clip_starts,
     decode_action,
     depth_valid_mask,
     rotate180,
     split_for_episode,
+    stride_root,
 )
 from examples.LIBERO.model2libero_interface import LIBERO_GRIPPER_CLOSE, LIBERO_GRIPPER_OPEN
 
-EVAL_LIBERO = Path(__file__).resolve().parents[1] / "examples" / "LIBERO" / "eval_libero.py"
+LIBERO_EXAMPLES = Path(__file__).resolve().parents[1] / "examples" / "LIBERO"
+EVAL_LIBERO = LIBERO_EXAMPLES / "eval_libero.py"
+RECORDER = LIBERO_EXAMPLES / "record_geo_clips.py"
 
 # LIBERO's own clipping planes for the LIBERO scenes, in metres; only the ordering matters here.
 Z_NEAR, Z_FAR = 0.1, 10.0
@@ -40,6 +49,12 @@ Z_NEAR, Z_FAR = 0.1, 10.0
 def eval_libero_source():
     """The evaluation entry point as text: parsed, never imported (it needs the LIBERO package)."""
     return EVAL_LIBERO.read_text()
+
+
+@pytest.fixture(scope="module")
+def recorder_source():
+    """Same treatment for the recorder: it imports `libero` and `robosuite` at module level."""
+    return RECORDER.read_text()
 
 
 def test_depth_rendering_is_off_by_default(eval_libero_source):
@@ -106,6 +121,75 @@ class TestClipStarts:
         """Fewer possible starts than requested clips must not produce duplicate clips."""
         starts = clip_starts(10, 8, 8)
         assert starts == [0, 1, 2]
+
+
+class TestClipStride:
+    """The stride axis of the delta-interval sweep: a clip's frame count is fixed, its reach is not."""
+
+    def test_the_span_is_the_reach_of_the_sampled_frames(self):
+        assert clip_span(8) == 8, "the default stride samples consecutive frames"
+        assert clip_span(8, 1) == 8
+        assert clip_span(8, 4) == 29, "frames 0, 4, ..., 28"
+        assert clip_span(1, 8) == 1, "a single frame reaches nowhere, whatever the stride"
+
+    def test_the_default_is_the_recorded_contract(self):
+        """Pinned so a stride sweep cannot silently change what an unparameterised call records."""
+        for num_frames in (8, 23, 100, 301):
+            assert clip_starts(num_frames, 8, 8) == clip_starts(num_frames, 8, 8, CLIP_STRIDE)
+
+    def test_strided_clips_stay_inside_the_episode(self):
+        """The bound is the span: bounding by the frame count would sample past the last frame."""
+        for stride in (1, 2, 4, 8):
+            span = clip_span(8, stride)
+            for num_frames in (span, span + 1, 100, 301, 520):
+                starts = clip_starts(num_frames, 8, 8, stride)
+                assert starts, f"stride {stride} on {num_frames} frames should still fit"
+                for start in starts:
+                    assert 0 <= start and start + span <= num_frames
+
+    def test_an_episode_too_short_for_one_strided_clip_yields_no_start(self):
+        """No truncated clip: a stride-8 clip is 57 frames or it is not written (see the sweep plan)."""
+        assert clip_starts(56, 8, 8, 8) == []
+        assert clip_starts(57, 8, 8, 8) == [0]
+
+    def test_a_wider_stride_packs_the_windows_closer_on_a_short_episode(self):
+        """The limitation the sweep has to report: on the shortest observed episode (71 frames) the
+        eight stride-8 windows begin within 14 frames of each other and so nearly coincide, while at
+        stride 1 they are spread over the episode. Sample count is unchanged; diversity is not.
+        """
+        assert clip_starts(71, 8, 8, 8) == [0, 2, 4, 6, 8, 10, 12, 14]
+        assert clip_starts(71, 8, 8, 1)[-1] == 63
+
+
+class TestStrideOutputLayout:
+    def test_each_stride_is_its_own_dataset_root(self):
+        """`load_manifest` globs `manifest_*.jsonl` at one root, so mixed durations must not share one."""
+        roots = {stride: stride_root("/data/sweep", stride) for stride in (1, 2, 8)}
+        assert roots[1] == Path("/data/sweep/s1")
+        assert roots[8] == Path("/data/sweep/s8")
+        assert len(set(roots.values())) == 3
+
+    def test_the_default_stride_is_nested_like_every_other(self):
+        """One rule rather than a flat special case, so a cache says what it was recorded with."""
+        assert stride_root("/data/sweep", CLIP_STRIDE).name == f"s{CLIP_STRIDE}"
+
+    def test_strides_are_deduplicated_and_ordered(self):
+        assert checked_strides([8, 1, 2, 1]) == [1, 2, 8]
+
+    def test_a_stride_below_one_is_refused(self):
+        """It would sample the same frame repeatedly or run the clip backwards through time."""
+        with pytest.raises(ValueError, match=">= 1"):
+            checked_strides([1, 0])
+        with pytest.raises(ValueError, match="at least one stride"):
+            checked_strides([])
+
+    def test_the_default_stride_list_is_the_recorded_contract(self, recorder_source):
+        """Same pinning as `camera_depths=False`: the sweep is opt-in, not the new default."""
+        assert "clip_strides: List[int] = dataclasses.field(default_factory=lambda: [CLIP_STRIDE])" in recorder_source
+
+    def test_clips_are_sliced_by_span_and_stride(self, recorder_source):
+        """`frames[start:start + clip_frames]` would ignore the stride and record consecutive frames."""
+        assert "window = slice(start, start + span, stride)" in recorder_source
 
 
 class TestSplitAssignment:

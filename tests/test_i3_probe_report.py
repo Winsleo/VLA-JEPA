@@ -10,12 +10,15 @@ plumbing, and each of them can be wrong in a way that changes a conclusion rathe
 * `_floor_skill` compares an arm against a feature-free predictor, so a flipped sign would turn "no
   better than a constant" into a positive result;
 * `_delta_interval` is the x-axis of the interval sweep: it turns lag and recording stride into
-  seconds, and the whole curve is mislabelled if that algebra is wrong.
+  seconds, and the whole curve is mislabelled if that algebra is wrong;
+* `_curve_point` and `_load_reports` assemble that curve out of many reports, where a mispaired floor
+  or a mis-sorted x axis would produce a plausible curve of the wrong thing.
 
 CPU-only: no teacher, no cache, no GPU. Values are hand-computable throughout.
 Run:  pytest tests/test_i3_probe_report.py -v
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -25,7 +28,7 @@ import pytest
 import torch
 
 from starVLA.model.modules.world_model.depth_targets import TARGET_TYPE_METRIC
-from starVLA.probes import geo_probe, probe_cache
+from starVLA.probes import geo_metrics, geo_probe, probe_cache
 
 # Same handling as `tests/test_i3_vjepa21_weight_check.py`: `scripts/` holds standalone entrypoints and
 # is not a package, so it goes on the path explicitly rather than being imported through a package.
@@ -234,3 +237,159 @@ def test_the_recorded_frame_count_agrees_with_the_derived_one():
     """The index stores `delta_frames` for readers; it must not be able to disagree with the algebra."""
     cache = _target_cache(delta_lag=2, clip_stride=2, tubelet_size=2, delta_frames=8)
     assert run_geo_probes._delta_interval(cache)["frames"] == cache.index["delta_frames"]
+
+
+# --------------------------------------------------------------------------------------
+# the curve: many reports read along one axis
+# --------------------------------------------------------------------------------------
+
+FLOOR, MOVING_FLOOR, SPREAD = 0.10, 0.60, 0.004
+FULL_ELEMENTS, MOVING_ELEMENTS = 1000, 340
+
+
+def _sweep_report(lag: int = 1, stride: int = 1, values=None, moving=None, kind: str = "delta") -> dict:
+    """A fit report reduced to what the sweep reads: one metric, its floor, its skill and its counts."""
+    values = values or {"A": 0.05}
+    moving = moving or {arm: 0.30 for arm in values}
+
+    def probes(arm: str) -> dict:
+        summary = {"metric": {"abs_rel": values[arm], "abs_rel_std": SPREAD}}
+        skill = {"metric": {"abs_rel": geo_metrics.relative_improvement(FLOOR, values[arm], "abs_rel")}}
+        counts = {"counts": {"states_valid": FULL_ELEMENTS}}
+        if kind == "delta":
+            summary["metric_moving"] = {"abs_rel": moving[arm], "abs_rel_std": 2 * SPREAD}
+            skill["metric_moving"] = {"abs_rel": geo_metrics.relative_improvement(MOVING_FLOOR, moving[arm], "abs_rel")}
+            counts["counts_moving"] = {"states_valid": MOVING_ELEMENTS}
+        return {
+            "summary": summary,
+            "summary_val": summary,
+            "floor_skill": skill,
+            "floor_skill_val": skill,
+            "per_seed": [counts],
+            "per_seed_val": [counts],
+        }
+
+    floors = {"metric": {"abs_rel": FLOOR}}
+    if kind == "delta":
+        floors["metric_moving"] = {"abs_rel": MOVING_FLOOR}
+    baselines = {kind: {run_geo_probes.FLOOR_BASELINE: floors}}
+    frames = 2 * lag * stride
+    return {
+        "arms": {arm: {"probes": {kind: probes(arm)}} for arm in values},
+        "baselines": baselines,
+        "baselines_val": baselines,
+        "floor_baseline": run_geo_probes.FLOOR_BASELINE,
+        "delta_interval": {
+            "delta_lag": lag,
+            "clip_stride": stride,
+            "tubelet_size": 2,
+            "frames": frames,
+            "seconds": frames / run_geo_probes.CONTROL_HZ,
+        },
+    }
+
+
+def test_each_reading_is_paired_with_its_own_floor_and_its_own_element_count():
+    """The failure this guards: scoring the moving subset against the whole grid's floor.
+
+    The subset is both harder and measured over fewer elements, so its floor is a different number;
+    crossing the two would invent skill out of nothing.
+    """
+    point = run_geo_probes._curve_point(_sweep_report(), "A", "delta", "metric", "abs_rel", "val")
+    assert (point["seconds"], point["frames"]) == (pytest.approx(0.10), 2)
+
+    full, moving = point["readings"]["full"], point["readings"]["moving"]
+    assert (full["value"], full["floor"], full["elements"]) == (0.05, FLOOR, FULL_ELEMENTS)
+    assert (moving["value"], moving["floor"], moving["elements"]) == (0.30, MOVING_FLOOR, MOVING_ELEMENTS)
+    assert full["skill"] == pytest.approx(0.5) and moving["skill"] == pytest.approx(0.5)
+    # Noise is the seed spread on the skill axis, so it shares the skill's denominator.
+    assert full["noise"] == pytest.approx(SPREAD / FLOOR)
+    assert moving["noise"] == pytest.approx(2 * SPREAD / MOVING_FLOOR)
+
+
+def test_a_state_probe_contributes_one_reading_only():
+    point = run_geo_probes._curve_point(_sweep_report(kind="state"), "A", "state", "metric", "abs_rel", "val")
+    assert set(point["readings"]) == {"full"}
+
+
+def test_the_split_decides_which_numbers_the_curve_is_built_from():
+    """The interval is chosen after seeing results, so the curve must be able to avoid the test set."""
+    report = _sweep_report()
+    report["arms"]["A"]["probes"]["delta"]["summary_val"] = {
+        "metric": {"abs_rel": 0.08, "abs_rel_std": SPREAD},
+    }
+    on_val = run_geo_probes._curve_point(report, "A", "delta", "metric", "abs_rel", "val")
+    on_test = run_geo_probes._curve_point(report, "A", "delta", "metric", "abs_rel", "test")
+    assert on_val["readings"]["full"]["value"] == 0.08
+    assert on_test["readings"]["full"]["value"] == 0.05
+    assert "moving" not in on_val["readings"], "the val summary here carries no moving class"
+
+
+def test_a_split_that_is_not_reported_is_refused():
+    with pytest.raises(SystemExit, match="not reported"):
+        run_geo_probes._split_suffix("train")
+
+
+def _write_reports(directory: Path, specs) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    for lag, stride in specs:
+        report = _sweep_report(lag=lag, stride=stride)
+        (directory / f"geo_probes_s{stride}_lag{lag}.json").write_text(json.dumps(report))
+
+
+def test_reports_are_ordered_along_the_interval_axis_with_stride_breaking_ties(tmp_path):
+    """Same duration at two strides is the H5 contrast, not a duplicate, so both stay on the curve."""
+    _write_reports(tmp_path, [(2, 1), (1, 1), (1, 2)])
+    loaded = run_geo_probes._load_reports([tmp_path])
+    assert [
+        (report["delta_interval"]["seconds"], report["delta_interval"]["clip_stride"]) for _, report in loaded
+    ] == [(0.10, 1), (0.20, 1), (0.20, 2)]
+
+
+def test_a_report_written_before_the_sweep_is_refused_rather_than_placed_at_zero(tmp_path):
+    path = tmp_path / "geo_probes_s1_lag1.json"
+    path.write_text(json.dumps({"arms": {}, "baselines": {}}))
+    with pytest.raises(SystemExit, match="delta_interval"):
+        run_geo_probes._load_reports([path])
+
+
+def test_a_directory_contributes_only_its_sweep_reports(tmp_path):
+    """`geo_probes.json` is the pre-sweep report and lives in the same directory; it is not a point."""
+    _write_reports(tmp_path, [(1, 1)])
+    (tmp_path / "geo_probes.json").write_text(json.dumps({"arms": {}}))
+    assert run_geo_probes._report_paths([tmp_path]) == [tmp_path / "geo_probes_s1_lag1.json"]
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(SystemExit, match="no reports matching"):
+        run_geo_probes._report_paths([empty])
+    with pytest.raises(SystemExit, match="no report at"):
+        run_geo_probes._report_paths([tmp_path / "absent.json"])
+
+
+def test_the_chart_draws_the_floor_and_puts_a_better_arm_higher():
+    lines = run_geo_probes._ascii_curve({"A": [(0.1, -10.0)], "D": [(0.1, 20.0)]})
+    floor_rows = [index for index, line in enumerate(lines) if set(line.split("|")[-1]) == {"-"}]
+    assert len(floor_rows) == 1, "exactly one zero line"
+    rows = {marker: [index for index, line in enumerate(lines) if marker in line] for marker in "AD"}
+    assert rows["D"][0] < floor_rows[0] < rows["A"][0], "positive skill above the floor, negative below"
+
+
+def test_the_chart_reports_nothing_to_plot_rather_than_an_empty_frame():
+    assert run_geo_probes._ascii_curve({"A": [(0.1, float("nan"))]}) == ["(nothing to plot)"]
+    assert run_geo_probes._ascii_curve({}) == ["(nothing to plot)"]
+
+
+def test_the_table_reports_every_point_in_both_readings_and_names_its_sources():
+    reports = {lag: _sweep_report(lag=lag, values={"A": 0.05, "D": 0.04}) for lag in (1, 2)}
+    points = [
+        run_geo_probes._curve_point(report, arm, "delta", "metric", "abs_rel", "val")
+        for report in reports.values()
+        for arm in ("A", "D")
+    ]
+    table = run_geo_probes._sweep_markdown(points, "abs_rel", "metric", "val", [Path("a.json"), Path("b.json")])
+    assert "abs_rel (all tokens)" in table and "abs_rel (moving subset)" in table
+    assert table.count("| 0.10 | 2 | 1 x 1 | A |") == 2, "one row per reading"
+    assert table.count("| 0.20 | 4 | 1 x 2 | D |") == 2
+    assert "- `a.json`" in table and "- `b.json`" in table
+    assert str(MOVING_ELEMENTS) in table and str(FULL_ELEMENTS) in table

@@ -20,6 +20,9 @@ Four stages, run in order:
     # probes, three seeds per arm, plus a closed-form ridge check and the feature-free baselines
     python scripts/run_geo_probes.py fit --arms A C D --kinds state delta
 
+    # one curve out of many fit reports: delta skill over the floor against the target interval
+    python scripts/run_geo_probes.py sweep --reports <probe cache>/reports --figure <docs figure path>
+
 The same `targets` and `fit` stages take `--estimator <name>` to swap the simulator depth for a
 precomputed pseudo-depth cache (`scripts/precompute_depth_targets.py`). That answers the S4 question
 "how much probe signal survives if the target comes from an estimator rather than the simulator": the
@@ -34,6 +37,12 @@ number "did the features help" actually asks for. Delta metrics come in two read
 grid and the subset that moved, because averaged over the whole grid a delta is dominated by tokens
 that did not change and on which the constant floor is exactly right.
 
+The `sweep` stage reads *across* reports instead of within one. A delta target spans
+`tubelet_size * delta_lag * clip_stride` frames, which at the LIBERO control rate is a duration, and
+that duration is the x axis of the curve: how much of a transition a frozen representation can predict
+depends on how much the scene moved in between. Each point keeps its own floor and its own seed
+spread, and the whole curve is emitted rather than only its best point.
+
 Nothing here constructs the Qwen backbone, the action model or the world predictor: the probe path
 instantiates a `VJBackboneAdapter` and (in the fit stage) a probe head, and nothing else
 (`docs/implementation-plan.md` section 9, pinned by `tests/test_i3_probe_firewall.py`).
@@ -41,6 +50,7 @@ instantiates a `VJBackboneAdapter` and (in the fit stage) a probe head, and noth
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -813,6 +823,218 @@ def _markdown(report: Dict) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# stage: the interval curve, assembled from a set of fit reports
+# --------------------------------------------------------------------------------------
+
+# What a sweep report is called, so pointing `--reports` at a directory cannot pick up a report from
+# before the sweep: those carry no `delta_interval` and would abort the whole aggregation.
+SWEEP_REPORT_GLOB = "geo_probes_s*_lag*.json"
+# The two element sets a delta is read over, in render order. See `geo_metrics.moving_mask`.
+READINGS = ("full", "moving")
+
+
+def _split_suffix(split: str) -> str:
+    """Report key suffix for a split; test is unsuffixed, for the reason `REPORTED_SPLITS` states."""
+    if split not in REPORTED_SPLITS:
+        raise SystemExit(f"split {split!r} is not reported; pick one of {REPORTED_SPLITS}")
+    return "" if split == "test" else VAL_SUFFIX
+
+
+def _report_paths(paths: Sequence[Path]) -> List[Path]:
+    """The given report files, with any directory expanded to the sweep reports inside it."""
+    expanded: List[Path] = []
+    for path in paths:
+        if path.is_dir():
+            expanded.extend(sorted(path.glob(SWEEP_REPORT_GLOB)))
+        elif path.exists():
+            expanded.append(path)
+        else:
+            # A missing point must not silently shorten the curve, which is why this is not a skip.
+            raise SystemExit(f"no report at {path}")
+    if not expanded:
+        raise SystemExit(f"no reports matching {SWEEP_REPORT_GLOB} under {[str(path) for path in paths]}")
+    return expanded
+
+
+def _load_reports(paths: Sequence[Path]) -> List[Tuple[Path, Dict]]:
+    """Reports ordered along the curve's x axis, i.e. by the interval their delta targets span.
+
+    Two reports may share an interval on purpose: the same duration reached with a wide recording
+    stride and with a wide lag is the H5 contrast, so the stride breaks the tie rather than being
+    treated as a duplicate.
+    """
+    reports = []
+    for path in _report_paths(paths):
+        report = json.loads(path.read_text())
+        if "delta_interval" not in report:
+            raise SystemExit(f"{path} predates the interval sweep and carries no delta_interval")
+        reports.append((path, report))
+    reports.sort(key=lambda item: (item[1]["delta_interval"]["seconds"], item[1]["delta_interval"]["clip_stride"]))
+    return reports
+
+
+def _curve_point(report: Dict, arm: str, kind: str, metric_class: str, metric: str, split: str) -> Dict:
+    """One (interval, arm) point: the metric, the floor it is read against, the skill and the noise.
+
+    Skill and seed spread are both divided by the floor's own value, so "did the arm beat a predictor
+    that never saw a feature" and "is that difference larger than reseeding the head" are two numbers
+    on one axis instead of two incomparable ones.
+    """
+    suffix = _split_suffix(split)
+    probes = report["arms"][arm]["probes"][kind]
+    summary, skills = probes[f"summary{suffix}"], probes[f"floor_skill{suffix}"]
+    floors = report[f"baselines{suffix}"][kind][report.get("floor_baseline", FLOOR_BASELINE)]
+    counts = probes[f"per_seed{suffix}"][0]
+
+    point = {"arm": arm, "kind": kind, "split": split, **report["delta_interval"], "readings": {}}
+    for reading in READINGS:
+        scored_class = metric_class if reading == "full" else f"{metric_class}_moving"
+        if metric not in summary.get(scored_class, {}):
+            continue
+        floor, value = floors[scored_class][metric], summary[scored_class][metric]
+        spread = summary[scored_class][f"{metric}_std"]
+        point["readings"][reading] = {
+            "value": value,
+            "spread": spread,
+            "floor": floor,
+            "skill": skills[scored_class][metric],
+            # The seed spread on the skill axis: a skill smaller than this is not distinguishable
+            # from having reseeded the head.
+            "noise": spread / abs(floor) if floor else float("nan"),
+            "elements": counts["counts" if reading == "full" else "counts_moving"]["states_valid"],
+        }
+    return point
+
+
+def _ascii_curve(series: Dict[str, List[Tuple[float, float]]], height: int = 11, cell: int = 7) -> List[str]:
+    """Skill in percent (y) against target interval in seconds (x), one marker character per arm.
+
+    Plain text on purpose: it lands in the results document next to the numbers, survives review as a
+    diff and needs no image viewer. The zero line is always drawn because zero is the feature-free
+    floor, which is the only reference that decides whether the features contributed at all.
+    """
+    xs = sorted({x for points in series.values() for x, _ in points})
+    ys = [y for points in series.values() for _, y in points if not math.isnan(y)]
+    if not xs or not ys:
+        return ["(nothing to plot)"]
+
+    top, bottom = max(ys + [0.0]), min(ys + [0.0])
+    span = (top - bottom) or 1.0
+    width = len(xs) * cell
+    canvas = [[" "] * width for _ in range(height)]
+
+    def row_of(value: float) -> int:
+        return int(round((top - value) / span * (height - 1)))
+
+    zero = row_of(0.0)
+    canvas[zero] = ["-"] * width
+    for label, points in sorted(series.items()):
+        for x, y in points:
+            if not math.isnan(y):
+                canvas[row_of(y)][xs.index(x) * cell] = label[0]
+
+    lines = []
+    for index, row in enumerate(canvas):
+        value = top - index / (height - 1) * span
+        prefix = f"{value:+7.1f} |" if index in (0, zero, height - 1) else f"{'':7} |"
+        lines.append(prefix + "".join(row))
+    return lines + [f"{'':8}+" + "-" * width, f"{'':9}" + "".join(f"{x:<{cell}g}" for x in xs)]
+
+
+def _sweep_markdown(points: List[Dict], metric: str, metric_class: str, split: str, sources: List[Path]) -> str:
+    """The curve as a table per reading, an ASCII chart of the skill, and the reports it came from."""
+    lines = [
+        f"### I3 delta interval sweep ({metric_class} class {metric}, {split} split, "
+        f"floor {FLOOR_BASELINE})",
+        "",
+    ]
+    for reading in READINGS:
+        rows = [point for point in points if reading in point["readings"]]
+        if not rows:
+            continue
+        subset = " (moving subset)" if reading == "moving" else " (all tokens)"
+        lines += [
+            f"**{metric}{subset}**",
+            "",
+            f"| interval s | frames | stride x lag | arm | {metric} | floor | skill % | seed noise % "
+            "| clears floor | elements |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+        ]
+        for point in rows:
+            scored = point["readings"][reading]
+            lines.append(
+                f"| {point['seconds']:.2f} | {point['frames']} | "
+                f"{point['clip_stride']} x {point['delta_lag']} | {point['arm']} | "
+                f"{scored['value']:.4f} +- {scored['spread']:.4f} | {scored['floor']:.4f} | "
+                f"{scored['skill'] * 100:+.2f} | {scored['noise'] * 100:.2f} | "
+                f"{scored['skill'] > scored['noise']} | {scored['elements']} |"
+            )
+        series: Dict[str, List[Tuple[float, float]]] = {}
+        for point in rows:
+            series.setdefault(point["arm"], []).append((point["seconds"], point["readings"][reading]["skill"] * 100))
+        lines += ["", f"skill % over the floor, {reading} reading (marker = arm):", "```", *_ascii_curve(series), "```"]
+    return "\n".join(lines + ["", "Sources:", *[f"- `{path}`" for path in sources]])
+
+
+def _write_figure(path: Path, points: List[Dict], metric: str, split: str) -> None:
+    """The same curve as a figure for the paper: skill over the floor, with the seed spread as error.
+
+    matplotlib is imported here rather than at module scope so the extract and fit stages, which run
+    on a GPU box and never plot, do not pay for the plotting stack.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    readings = [reading for reading in READINGS if any(reading in point["readings"] for point in points)]
+    figure, axes = plt.subplots(1, len(readings), figsize=(5.5 * len(readings), 4.0), squeeze=False)
+    for axis, reading in zip(axes[0], readings, strict=True):
+        for arm in sorted({point["arm"] for point in points}):
+            rows = [point for point in points if point["arm"] == arm and reading in point["readings"]]
+            axis.errorbar(
+                [point["seconds"] for point in rows],
+                [point["readings"][reading]["skill"] * 100 for point in rows],
+                yerr=[point["readings"][reading]["noise"] * 100 for point in rows],
+                marker="o",
+                capsize=3,
+                label=f"arm {arm}",
+            )
+        axis.axhline(0.0, color="black", linewidth=0.8)  # the feature-free floor
+        axis.set_xlabel("delta target interval (s)")
+        axis.set_ylabel(f"skill over {FLOOR_BASELINE} (%)")
+        axis.set_title(f"{metric}, {'all tokens' if reading == 'full' else 'moving subset'} ({split})")
+        axis.legend()
+    figure.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in (".png", ".pdf"):
+        figure.savefig(path.with_suffix(suffix), dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    print(f"figure -> {path.with_suffix('.png')} and {path.with_suffix('.pdf')}", flush=True)
+
+
+def run_sweep(args: argparse.Namespace) -> None:
+    reports = _load_reports(args.reports)
+    points = [
+        _curve_point(report, arm, args.kind, args.metric_class, args.metric, args.split)
+        for _, report in reports
+        for arm in args.arms
+        if arm in report["arms"] and args.kind in report["arms"][arm]["probes"]
+    ]
+    if not points:
+        raise SystemExit(f"no {args.kind} probe for arms {args.arms} in {len(reports)} reports")
+
+    text = _sweep_markdown(points, args.metric, args.metric_class, args.split, [path for path, _ in reports])
+    print(text, flush=True)
+    if args.markdown:
+        args.markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown.write_text(text + "\n")
+        print(f"table -> {args.markdown}", flush=True)
+    if args.figure:
+        _write_figure(args.figure, points, args.metric, args.split)
+
+
+# --------------------------------------------------------------------------------------
 # command line
 # --------------------------------------------------------------------------------------
 
@@ -884,6 +1106,28 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--device", default="cuda")
     fit.add_argument("--report", type=Path, default=DEFAULT_OUT / "reports" / "geo_probes.json")
     fit.set_defaults(handler=run_fit)
+
+    sweep = subparsers.add_parser("sweep", help="assemble the delta interval curve from a set of fit reports")
+    sweep.add_argument(
+        "--reports",
+        type=Path,
+        nargs="+",
+        default=[DEFAULT_OUT / "reports"],
+        help=f"report files, or directories searched for {SWEEP_REPORT_GLOB}",
+    )
+    sweep.add_argument("--arms", nargs="+", default=list(arm_registry.PRIMARY_PAIR))
+    sweep.add_argument("--kind", default="delta", choices=["state", "delta"])
+    sweep.add_argument("--metric-class", default="metric", choices=list(METRIC_CLASSES))
+    sweep.add_argument("--metric", default=geo_probe.SELECTION_METRIC)
+    sweep.add_argument(
+        "--split",
+        default="val",
+        choices=list(REPORTED_SPLITS),
+        help="val by default: the interval is chosen after seeing results, so it may not be chosen on test",
+    )
+    sweep.add_argument("--markdown", type=Path, default=None, help="also write the table to this file")
+    sweep.add_argument("--figure", type=Path, default=None, help="write <path>.png and <path>.pdf")
+    sweep.set_defaults(handler=run_sweep)
 
     return parser
 

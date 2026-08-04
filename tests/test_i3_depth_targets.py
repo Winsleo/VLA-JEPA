@@ -30,6 +30,7 @@ from starVLA.model.modules.world_model.depth_targets import (
     DepthTarget,
     adjacent_delta,
     build_metric_delta_targets,
+    lagged_delta,
     log_metric_depth,
     normalize_clip_level,
     pool_to_grid,
@@ -182,6 +183,66 @@ class TestAdjacentDelta:
         )
         with pytest.raises(ValueError, match="at least 2 states"):
             adjacent_delta(states)
+
+
+class TestLaggedDelta:
+    """The interval sweep's one degree of freedom: differencing states `lag` blocks apart."""
+
+    @staticmethod
+    def _states(values):
+        count = len(values)
+        return DepthTarget(
+            values=torch.tensor(values).reshape(1, count, 1, 1, 1, 1),
+            mask=torch.ones(1, count, 1, 1, 1, 1, dtype=torch.bool),
+            target_type=TARGET_TYPE_METRIC,
+            units=UNITS_LOG_METER,
+        )
+
+    def test_lag_one_is_bitwise_the_adjacent_delta(self):
+        """The default path must not move: every pre-sweep number was produced by this branch."""
+        states = self._states([0.0, 1.0, 3.0, 6.5])
+        assert torch.equal(lagged_delta(states, lag=1).values, adjacent_delta(states).values)
+        assert torch.equal(lagged_delta(states, lag=1).mask, adjacent_delta(states).mask)
+
+    def test_larger_lags_span_more_blocks(self):
+        states = self._states([0.0, 1.0, 3.0, 6.5])
+        assert lagged_delta(states, lag=2).values.reshape(-1).tolist() == [3.0, 5.5]
+        assert lagged_delta(states, lag=3).values.reshape(-1).tolist() == [6.5]
+
+    def test_masks_are_intersected_at_the_lagged_endpoints(self):
+        """Only the two endpoints matter: an invalid state between them does not veto the pair."""
+        mask = torch.ones(1, 4, 1, 1, 1, 1, dtype=torch.bool)
+        mask[0, 1] = False
+        states = DepthTarget(
+            values=torch.arange(4, dtype=torch.float32).reshape(1, 4, 1, 1, 1, 1),
+            mask=mask,
+            target_type=TARGET_TYPE_METRIC,
+            units=UNITS_LOG_METER,
+        )
+        assert lagged_delta(states, lag=2).mask.reshape(-1).tolist() == [True, False]
+        assert lagged_delta(states, lag=3).mask.reshape(-1).tolist() == [True]
+
+    def test_units_become_a_delta_regardless_of_lag(self):
+        assert lagged_delta(self._states([0.0, 1.0, 3.0]), lag=2).units == UNITS_LOG_METER_DELTA
+
+    def test_a_lag_the_states_cannot_span_is_refused(self):
+        states = self._states([0.0, 1.0, 3.0])
+        with pytest.raises(ValueError, match="at least 4 states"):
+            lagged_delta(states, lag=3)
+
+    def test_a_non_positive_lag_is_refused(self):
+        with pytest.raises(ValueError, match="at least 1"):
+            lagged_delta(self._states([0.0, 1.0]), lag=0)
+
+    def test_the_pipeline_passes_the_lag_through_without_touching_the_states(self):
+        depth = cache_clip()
+        states, deltas = build_metric_delta_targets(depth, tubelet_size=TUBELET, grid=(4, 4))
+        lagged_states, lagged_deltas = build_metric_delta_targets(
+            depth, tubelet_size=TUBELET, grid=(4, 4), delta_lag=2
+        )
+        assert torch.equal(states.values, lagged_states.values)
+        assert lagged_deltas.values.shape[1] == states.values.shape[1] - 2
+        assert torch.equal(lagged_deltas.values, lagged_delta(states, lag=2).values)
 
 
 class TestPoolToGrid:

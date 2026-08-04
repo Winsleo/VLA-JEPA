@@ -90,6 +90,73 @@ def test_the_delta_head_reads_both_endpoints_and_nothing_more():
     assert sum(p.numel() for p in geo_probe.LinearReadout(2048).parameters()) == 2049
 
 
+# --------------------------------------------------------------------------------------
+# delta lag: the head's endpoints and its targets must span the same interval
+# --------------------------------------------------------------------------------------
+
+def _probe_inputs(blocks: int, delta_lag: int) -> geo_probe.ProbeInputs:
+    """One row on a 2x2 grid, with delta targets consistent with `delta_lag`."""
+    hidden, grid = 8, (2, 2)
+    states = torch.zeros(1, blocks, NUM_VIEWS, 1, *grid)
+    return geo_probe.ProbeInputs(
+        features=torch.zeros(1, blocks * grid[0] * grid[1], NUM_VIEWS * hidden),
+        states=states,
+        states_mask=torch.ones_like(states, dtype=torch.bool),
+        deltas=states[:, delta_lag:],
+        deltas_mask=torch.ones_like(states[:, delta_lag:], dtype=torch.bool),
+        grid=grid,
+        num_views=NUM_VIEWS,
+        delta_lag=delta_lag,
+    )
+
+
+@pytest.mark.parametrize("lag", [1, 2, 3])
+def test_the_delta_head_pairs_blocks_exactly_the_lag_apart(lag):
+    """`lag` widens the interval the head sees; the channel width stays 2D, so capacity is unchanged."""
+    views = torch.arange(4, dtype=torch.float32).reshape(1, 4, 1, 1, 1, 1).expand(1, 4, NUM_VIEWS, 2, 2, 8)
+    paired = geo_probe.delta_inputs(views.contiguous(), lag=lag)
+    assert paired.shape == (1, 4 - lag, NUM_VIEWS, 2, 2, 16)
+    assert torch.equal(paired[..., :8], views[:, : 4 - lag])
+    assert torch.equal(paired[..., 8:], views[:, lag:])
+
+
+def test_the_default_lag_is_the_adjacent_pairing():
+    views = torch.randn(1, 4, NUM_VIEWS, 2, 2, 8)
+    assert torch.equal(geo_probe.delta_inputs(views), geo_probe.delta_inputs(views, lag=1))
+    assert torch.equal(geo_probe.head_inputs(views, "delta"), geo_probe.delta_inputs(views, lag=1))
+
+
+def test_a_lag_wider_than_the_clip_is_refused():
+    with pytest.raises(ValueError, match="at least 5 temporal blocks"):
+        geo_probe.delta_inputs(torch.zeros(1, 4, NUM_VIEWS, 2, 2, 8), lag=4)
+
+
+def test_probe_inputs_refuse_targets_that_disagree_with_the_lag():
+    """The invariant that keeps a lag-2 target set from being fitted with adjacent-pair inputs."""
+    with pytest.raises(ValueError, match="do not match"):
+        blocks, grid, hidden = 4, (2, 2), 8
+        states = torch.zeros(1, blocks, NUM_VIEWS, 1, *grid)
+        geo_probe.ProbeInputs(
+            features=torch.zeros(1, blocks * grid[0] * grid[1], NUM_VIEWS * hidden),
+            states=states,
+            states_mask=torch.ones_like(states, dtype=torch.bool),
+            deltas=states[:, 1:],
+            deltas_mask=torch.ones_like(states[:, 1:], dtype=torch.bool),
+            grid=grid,
+            num_views=NUM_VIEWS,
+            delta_lag=2,
+        )
+
+
+@pytest.mark.parametrize("lag", [1, 2, 3])
+def test_the_head_input_matches_its_own_delta_targets(lag):
+    """The single entry point: head rows and target rows agree by construction, at any lag."""
+    data = _probe_inputs(blocks=4, delta_lag=lag)
+    targets, _ = data.target("delta")
+    assert data.head_input("delta").shape[:2] == targets.shape[:2]
+    assert data.head_input("state").shape[1] == data.states.shape[1]
+
+
 def test_an_optimizer_tracks_exactly_the_head_parameters():
     head = geo_probe.LinearReadout(8)
     optimizer = torch.optim.Adam(head.parameters(), lr=1e-3)
@@ -167,6 +234,30 @@ def test_the_teacher_stays_in_eval_across_a_probe_step(arm_a_adapter):
     clip = _clip((5, 6), arm_a_adapter.image_size, arm_a_adapter.num_frames)
     arm_a_adapter.encode_video(clip)
     assert not arm_a_adapter.encoder.training
+
+
+# --------------------------------------------------------------------------------------
+# cache paths: incompatible target sets must not be able to occupy the same directory
+# --------------------------------------------------------------------------------------
+
+def test_every_target_variant_gets_its_own_directory():
+    """Grid, estimator and lag all live in the path, so no two target sets can overwrite each other."""
+    grid = (16, 16)
+    paths = {
+        probe_cache.targets_dir("/root", grid),
+        probe_cache.targets_dir("/root", grid, "DA3METRIC-LARGE"),
+        probe_cache.targets_dir("/root", grid, None, 2),
+        probe_cache.targets_dir("/root", grid, "DA3METRIC-LARGE", 2),
+        probe_cache.targets_dir("/root", (8, 8)),
+    }
+    assert len(paths) == 5
+
+
+def test_the_default_lag_leaves_the_target_path_unchanged():
+    """The pre-sweep caches on disk must stay readable without being rebuilt."""
+    assert probe_cache.targets_dir("/root", (16, 16), None, 1) == probe_cache.targets_dir("/root", (16, 16))
+    assert probe_cache.targets_dir("/root", (16, 16), "est", 1) == probe_cache.targets_dir("/root", (16, 16), "est")
+    assert probe_cache.targets_dir("/root", (16, 16), None, 3).name == "16x16__lag3"
 
 
 # --------------------------------------------------------------------------------------

@@ -53,14 +53,21 @@ def features_dir(root, arm_name: str) -> Path:
     return Path(root) / FEATURES_DIR / arm_name
 
 
-def targets_dir(root, grid: Tuple[int, int], estimator: Optional[str] = None) -> Path:
+def targets_dir(root, grid: Tuple[int, int], estimator: Optional[str] = None, delta_lag: int = 1) -> Path:
     """Directory of one target set. `estimator` names a pseudo-depth source; None is the simulator.
 
     The estimator is part of the *path* rather than a field inside one shared directory so that the
     simulator targets and every estimator's targets can coexist and be fitted against separately --
     and so that a probe run cannot read a pseudo target set while believing it holds ground truth.
+    `delta_lag` follows the same rule for the same reason: a lag-3 delta set is a different target
+    from a lag-1 one and must not be fitted while a reader believes it holds adjacent transitions.
+    The default lag leaves the path unchanged, so the pre-sweep caches stay readable in place.
     """
-    suffix = f"{grid[0]}x{grid[1]}" if estimator is None else f"{grid[0]}x{grid[1]}__{estimator}"
+    suffix = f"{grid[0]}x{grid[1]}"
+    if estimator is not None:
+        suffix += f"__{estimator}"
+    if delta_lag != 1:
+        suffix += f"__lag{delta_lag}"
     return Path(root) / TARGETS_DIR / suffix
 
 
@@ -169,6 +176,11 @@ class TargetCache:
     @property
     def target_type(self) -> str:
         return self.index["target_type"]
+
+    @property
+    def delta_lag(self) -> int:
+        """Blocks the delta targets span. Absent in caches written before the lag sweep, i.e. lag 1."""
+        return int(self.index.get("delta_lag", 1))
 
 
 def write_targets(

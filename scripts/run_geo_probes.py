@@ -74,6 +74,13 @@ DEFAULT_PSEUDO = Path("/vepfs/wangshilong/data/dynaweave/i3_pseudo_depth")
 # target grid does not exist (`starVLA/probes/arms.py`, user decision 2026-08-03).
 DEFAULT_GRIDS = ((16, 16),)
 TUBELET_SIZE = 2
+# Clip caches recorded before the delta-interval sweep carry no `clip_stride` field; the recorder's
+# only behaviour then was consecutive frames, i.e. stride 1 (`examples/LIBERO/geo_clip_contract.py`).
+DEFAULT_CLIP_STRIDE = 1
+# LIBERO's control rate, the only place frame counts become durations. Fixed by
+# `libero/libero/envs/env_wrapper.py`'s `control_freq = 20`, which the recorder does not override, so
+# one recorded frame is one control step is 0.05 s.
+CONTROL_HZ = 20.0
 
 
 def _git_commit(root: Path) -> str:
@@ -110,6 +117,18 @@ def _loader(dataset: DepthClipCacheDataset, batch_size: int, num_workers: int) -
         pin_memory=False,
         drop_last=False,
     )
+
+
+def _clip_stride(dataset: DepthClipCacheDataset) -> int:
+    """The frame stride every clip in the cache was cut at, refusing a cache that mixes strides.
+
+    Mixing strides inside one root would put clips spanning different real durations into the same
+    target set, which is exactly the confound the interval sweep is built to separate.
+    """
+    strides = {int(row.get("clip_stride", DEFAULT_CLIP_STRIDE)) for row in dataset.rows}
+    if len(strides) != 1:
+        raise SystemExit(f"clip cache {dataset.root} mixes recording strides {sorted(strides)}")
+    return strides.pop()
 
 
 def _row_index(dataset: DepthClipCacheDataset) -> Dict:
@@ -160,7 +179,7 @@ def run_targets(args: argparse.Namespace) -> None:
     grids = [tuple(grid) for grid in args.grids]
     estimator = getattr(args, "estimator", None)
     source = "simulator metric depth" if estimator is None else f"pseudo depth from {estimator}"
-    print(f"targets: {len(dataset)} clips -> grids {grids} ({source})", flush=True)
+    print(f"targets: {len(dataset)} clips -> grids {grids} ({source}, delta lag {args.delta_lag})", flush=True)
 
     buffers: Dict[Tuple[int, int], Dict[str, List[np.ndarray]]] = {
         grid: {"states": [], "states_mask": [], "deltas": [], "deltas_mask": []} for grid in grids
@@ -184,6 +203,7 @@ def run_targets(args: argparse.Namespace) -> None:
                 d_min=args.d_min,
                 d_max=args.d_max,
                 target_type=TARGET_TYPE_METRIC if estimator is None else TARGET_TYPE_PSEUDO_METRIC,
+                delta_lag=args.delta_lag,
             )
             target_type = states.target_type
             store = buffers[grid]
@@ -193,15 +213,21 @@ def run_targets(args: argparse.Namespace) -> None:
             store["deltas_mask"].append(deltas.mask.numpy())
 
     index_rows = _row_index(dataset)
+    clip_stride = _clip_stride(dataset)
     for grid in grids:
         stacked = {name: np.concatenate(chunks, axis=0) for name, chunks in buffers[grid].items()}
-        directory = probe_cache.targets_dir(args.out, grid, estimator)
+        directory = probe_cache.targets_dir(args.out, grid, estimator, args.delta_lag)
         index = {
             **index_rows,
             "grid": list(grid),
             "target_type": target_type,
             "units": "log_meter",
             "tubelet_size": TUBELET_SIZE,
+            "delta_lag": args.delta_lag,
+            "clip_stride": clip_stride,
+            # The interval the delta target actually spans, so a reader never has to recompute it
+            # from the recording stride and the tubelet size by hand.
+            "delta_frames": TUBELET_SIZE * args.delta_lag * clip_stride,
             "d_min": args.d_min,
             "d_max": args.d_max,
             "states_shape": list(stacked["states"].shape),
@@ -396,6 +422,7 @@ def _probe_inputs(
     rows: np.ndarray,
     order: np.ndarray,
     device: str,
+    delta_lag: int = 1,
 ) -> geo_probe.ProbeInputs:
     """Assemble one split, with the target rows reordered onto the feature cache's row order."""
     target_rows = order[rows]
@@ -411,6 +438,7 @@ def _probe_inputs(
         deltas_mask=load(targets.deltas_mask[target_rows], torch.bool),
         grid=cache.grid,
         num_views=cache.num_views,
+        delta_lag=delta_lag,
     )
 
 
@@ -463,9 +491,33 @@ def _summarise(seed_runs: List[Dict]) -> Dict[str, Dict[str, float]]:
     return summary
 
 
+def _delta_interval(targets: probe_cache.TargetCache) -> Dict:
+    """How far apart in real time the two endpoints of one delta target are.
+
+    `frames = tubelet_size * delta_lag * clip_stride`, converted with the LIBERO control rate. Target
+    caches written before the sweep carry neither the stride nor the lag, so both default to 1 and the
+    derived interval reproduces the original 2-frame contract.
+    """
+    lag = targets.delta_lag
+    stride = int(targets.index.get("clip_stride", DEFAULT_CLIP_STRIDE))
+    tubelet = int(targets.index.get("tubelet_size", TUBELET_SIZE))
+    frames = tubelet * lag * stride
+    return {
+        "delta_lag": lag,
+        "clip_stride": stride,
+        "tubelet_size": tubelet,
+        "frames": frames,
+        "seconds": frames / CONTROL_HZ,
+    }
+
+
 def run_fit(args: argparse.Namespace) -> None:
     grid = tuple(args.grid)
-    targets = probe_cache.TargetCache.open(probe_cache.targets_dir(args.out, grid, args.estimator))
+    targets = probe_cache.TargetCache.open(probe_cache.targets_dir(args.out, grid, args.estimator, args.delta_lag))
+    # The lag is read back off the cache rather than trusted from the command line: the directory name
+    # encodes it, so a mismatch means the two disagree about what the targets are.
+    if targets.delta_lag != args.delta_lag:
+        raise SystemExit(f"target cache at lag {targets.delta_lag} was requested as lag {args.delta_lag}")
     config = geo_probe.FitConfig(
         lr_grid=args.lr_grid,
         epochs=args.epochs,
@@ -481,7 +533,14 @@ def run_fit(args: argparse.Namespace) -> None:
             raise SystemExit(f"arm {name} publishes grid {cache.grid}, targets are on {grid}")
         order = probe_cache.align_rows(cache.paths, targets.paths)
         splits = {
-            split: _probe_inputs(cache, targets, probe_cache.split_rows(cache.index, split), order, args.device)
+            split: _probe_inputs(
+                cache,
+                targets,
+                probe_cache.split_rows(cache.index, split),
+                order,
+                args.device,
+                targets.delta_lag,
+            )
             for split in ("train", "val", "test")
         }
         print(
@@ -552,7 +611,11 @@ def run_fit(args: argparse.Namespace) -> None:
             "epochs": list(config.epochs),
             "batch_rows": config.batch_rows,
             "ridge_grid": list(config.ridge_grid),
+            "delta_lag": targets.delta_lag,
         },
+        # What one delta step spans in this report, carried so a curve can be assembled from a
+        # directory of reports without re-deriving it from each cache.
+        "delta_interval": _delta_interval(targets),
         "arms": results,
         "baselines": baselines,
         "primary": _primary_comparison(results, args.kinds),
@@ -600,7 +663,12 @@ def _primary_comparison(results: Dict[str, Dict], kinds: Sequence[str]) -> Dict:
 def _markdown(report: Dict) -> str:
     """Results table with the two metric classes kept in separate blocks."""
     source = report.get("estimator") or "simulator"
-    lines = [f"### I3 probe results (grid {report['grid']}, target {report['target_type']}, source {source})", ""]
+    interval = report.get("delta_interval", {})
+    span = f", delta {interval['frames']} frames / {interval['seconds']:.2f}s" if interval else ""
+    lines = [
+        f"### I3 probe results (grid {report['grid']}, target {report['target_type']}, source {source}{span})",
+        "",
+    ]
     for kind in sorted({kind for arm in report["arms"].values() for kind in arm["probes"]}):
         rows = {name: arm["probes"][kind]["summary"] for name, arm in report["arms"].items() if kind in arm["probes"]}
         if not rows:
@@ -670,6 +738,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="build targets from this estimator's pseudo-depth cache instead of the simulator depth",
     )
     targets.add_argument("--pseudo-root", type=Path, default=DEFAULT_PSEUDO, help="root of the pseudo-depth caches")
+    targets.add_argument("--delta-lag", type=int, default=1, help="tubelet blocks one delta target spans")
     targets.set_defaults(handler=run_targets)
 
     cache = subparsers.add_parser("cache", help="extract frozen teacher features for one or more arms")
@@ -702,6 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="fit against this estimator's pseudo targets instead of the simulator ones",
     )
+    fit.add_argument("--delta-lag", type=int, default=1, help="lag of the target set to fit against")
     fit.add_argument("--seeds", type=int, nargs="+", default=list(geo_probe.DEFAULT_SEEDS))
     fit.add_argument("--lr-grid", type=float, nargs="+", default=list(geo_probe.DEFAULT_LR_GRID))
     fit.add_argument("--epochs", type=int, nargs="+", default=list(geo_probe.DEFAULT_EPOCHS))

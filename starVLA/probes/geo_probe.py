@@ -67,13 +67,18 @@ def tokens_to_views(features: torch.Tensor, grid: Tuple[int, int], num_views: in
     return unpacked.permute(0, 1, 4, 2, 3, 5)
 
 
-def delta_inputs(views: torch.Tensor) -> torch.Tensor:
-    """Pair up adjacent temporal blocks: `[N, Tp, V, h, w, D] -> [N, Tp - 1, V, h, w, 2D]`.
+def delta_inputs(views: torch.Tensor, lag: int = 1) -> torch.Tensor:
+    """Pair up temporal blocks `lag` apart: `[N, Tp, V, h, w, D] -> [N, Tp - lag, V, h, w, 2D]`.
 
     The delta head sees both endpoints of a transition, which is the least it needs to predict change
-    without being handed the change itself.
+    without being handed the change itself. `lag` must match the lag its targets were built with, so
+    that the head's two endpoints are the same two states the target differenced.
     """
-    return torch.cat([views[:, :-1], views[:, 1:]], dim=-1)
+    if lag < 1:
+        raise ValueError(f"lag must be at least 1, got {lag}")
+    if views.shape[1] < lag + 1:
+        raise ValueError(f"need at least {lag + 1} temporal blocks for a lag-{lag} pair, got {views.shape[1]}")
+    return torch.cat([views[:, :-lag], views[:, lag:]], dim=-1)
 
 
 def to_target_layout(predictions: torch.Tensor) -> torch.Tensor:
@@ -108,8 +113,11 @@ class ProbeInputs:
         features: `[N, blocks * h * w, V * D]`, the cached frozen teacher features. Kept in float16 as
             stored and cast per batch, so a whole arm fits in device memory.
         states / states_mask: `[N, Tp, V, 1, h, w]` log-depth targets and their validity.
-        deltas / deltas_mask: `[N, Tp - 1, V, 1, h, w]` adjacent-delta targets.
+        deltas / deltas_mask: `[N, Tp - delta_lag, V, 1, h, w]` delta targets.
         grid: token grid the features and targets share.
+        delta_lag: how many temporal blocks the delta targets span. It lives here rather than being
+            passed at every call site because it is a property of the loaded target set, and the head
+            input has to be paired with the same lag the targets were differenced at.
     """
 
     features: torch.Tensor
@@ -119,11 +127,18 @@ class ProbeInputs:
     deltas_mask: torch.Tensor
     grid: Tuple[int, int]
     num_views: int = 2
+    delta_lag: int = 1
 
     def __post_init__(self) -> None:
         counts = {self.features.shape[0], self.states.shape[0], self.deltas.shape[0]}
         if len(counts) != 1:
             raise ValueError(f"features and targets disagree on row count: {counts}")
+        expected_deltas = self.states.shape[1] - self.delta_lag
+        if self.deltas.shape[1] != expected_deltas:
+            raise ValueError(
+                f"{self.deltas.shape[1]} delta blocks do not match {self.states.shape[1]} states "
+                f"at lag {self.delta_lag} (expected {expected_deltas})"
+            )
 
     @property
     def num_rows(self) -> int:
@@ -144,13 +159,21 @@ class ProbeInputs:
             return values, mask
         return values[rows], mask[rows]
 
+    def head_input(self, kind: str, rows: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """The head's input for `rows`, paired at this split's own `delta_lag`.
 
-def head_inputs(views: torch.Tensor, kind: str) -> torch.Tensor:
-    """Per-token head input for a probe kind: the block itself, or a pair of adjacent blocks."""
+        The single entry point every fitting and prediction routine goes through, so the lag cannot
+        drift between a target set and the features fed against it.
+        """
+        return head_inputs(self.views(rows), kind, lag=self.delta_lag)
+
+
+def head_inputs(views: torch.Tensor, kind: str, lag: int = 1) -> torch.Tensor:
+    """Per-token head input for a probe kind: the block itself, or a pair of blocks `lag` apart."""
     if kind == "state":
         return views
     if kind == "delta":
-        return delta_inputs(views)
+        return delta_inputs(views, lag=lag)
     raise ValueError(f"unknown probe kind {kind!r}")
 
 
@@ -180,7 +203,7 @@ def predict(head: nn.Module, data: ProbeInputs, kind: str, batch_rows: int = 64)
     outputs: List[torch.Tensor] = []
     for start in range(0, data.num_rows, batch_rows):
         rows = torch.arange(start, min(start + batch_rows, data.num_rows), device=data.features.device)
-        outputs.append(head(head_inputs(data.views(rows), kind)))
+        outputs.append(head(data.head_input(kind, rows)))
     return torch.cat(outputs, dim=0)
 
 
@@ -215,7 +238,7 @@ def fit_sgd(
             for start in range(0, train.num_rows, config.batch_rows):
                 rows = order[start : start + config.batch_rows].to(device)
                 targets, mask = train.target(kind, rows)
-                loss = masked_l1(head(head_inputs(train.views(rows), kind)), targets, mask)
+                loss = masked_l1(head(train.head_input(kind, rows)), targets, mask)
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
@@ -256,7 +279,7 @@ def fit_ridge(
 
     for start in range(0, train.num_rows, batch_rows):
         rows = torch.arange(start, min(start + batch_rows, train.num_rows), device=device)
-        inputs = head_inputs(train.views(rows), kind)
+        inputs = train.head_input(kind, rows)
         targets, mask = train.target(kind, rows)
         # `[N, T, V, h, w, D] -> [rows, D]`, dropping invalid tokens instead of weighting them.
         flat_inputs = inputs.reshape(-1, in_dim).to(torch.float64)

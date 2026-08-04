@@ -14,7 +14,7 @@ Two invariants drive the interface:
   folded into one mask.
 
 Axis convention follows section 4.1. Raw cache depth is `[B, V, T, 1, H, W]`; tubelet selection
-returns `[B, Tp, V, 1, H, W]`; adjacent deltas return `[B, Tp - 1, V, 1, H, W]`.
+returns `[B, Tp, V, 1, H, W]`; lag-`k` deltas return `[B, Tp - k, V, 1, H, W]`, with `k = 1` the default.
 """
 
 from dataclasses import dataclass
@@ -199,23 +199,33 @@ def tubelet_last_frame(cache_depth: torch.Tensor, tubelet_size: int) -> torch.Te
     return selected.permute(0, 2, 1, 3, 4, 5).contiguous()
 
 
-def adjacent_delta(target: DepthTarget, time_dim: int = 1) -> DepthTarget:
-    """`dD~_k = D~_{k+1} - D~_k` over tubelet states, with masks intersected pairwise.
+def lagged_delta(target: DepthTarget, lag: int = 1, time_dim: int = 1) -> DepthTarget:
+    """`dD~_k = D~_{k+lag} - D~_k` over tubelet states, with masks intersected pairwise.
 
-    `[B, Tp, ...] -> [B, Tp - 1, ...]`, i.e. the K transitions of section 4.1.
+    `[B, Tp, ...] -> [B, Tp - lag, ...]`. `lag = 1` is the adjacent-transition contract of section
+    4.1; a larger lag widens the interval the target spans while leaving the teacher's input
+    untouched, which is what makes the delta interval a separable axis rather than a property of the
+    recording (I3 interval sweep, `docs/experiments/i3-geo-probes.md`).
     """
-    if target.values.shape[time_dim] < 2:
-        raise ValueError(f"need at least 2 states on dim {time_dim} to form a delta")
+    if lag < 1:
+        raise ValueError(f"lag must be at least 1, got {lag}")
+    num_states = target.values.shape[time_dim]
+    if num_states < lag + 1:
+        raise ValueError(f"need at least {lag + 1} states on dim {time_dim} to form a lag-{lag} delta")
 
-    later = target.values.narrow(time_dim, 1, target.values.shape[time_dim] - 1)
-    earlier = target.values.narrow(time_dim, 0, target.values.shape[time_dim] - 1)
-    mask = target.mask.narrow(time_dim, 1, target.mask.shape[time_dim] - 1) & target.mask.narrow(
-        time_dim, 0, target.mask.shape[time_dim] - 1
-    )
+    span = num_states - lag
+    later = target.values.narrow(time_dim, lag, span)
+    earlier = target.values.narrow(time_dim, 0, span)
+    mask = target.mask.narrow(time_dim, lag, span) & target.mask.narrow(time_dim, 0, span)
 
     values = torch.where(mask, later - earlier, torch.zeros_like(later))
     units = UNITS_LOG_METER_DELTA if target.units == UNITS_LOG_METER else target.units
     return target.replace(values=values, mask=mask, units=units)
+
+
+def adjacent_delta(target: DepthTarget, time_dim: int = 1) -> DepthTarget:
+    """`dD~_k = D~_{k+1} - D~_k`, i.e. the K transitions of section 4.1: `lagged_delta` at lag 1."""
+    return lagged_delta(target, lag=1, time_dim=time_dim)
 
 
 def pool_to_grid(target: DepthTarget, grid: Tuple[int, int]) -> DepthTarget:
@@ -261,6 +271,7 @@ def build_metric_delta_targets(
     d_min: float = DEFAULT_D_MIN,
     d_max: float = DEFAULT_D_MAX,
     target_type: str = TARGET_TYPE_METRIC,
+    delta_lag: int = 1,
 ) -> Tuple[DepthTarget, DepthTarget]:
     """The default metric pipeline: log-clip, tubelet-align, optionally pool, then difference.
 
@@ -272,10 +283,12 @@ def build_metric_delta_targets(
         target_type: `TARGET_TYPE_METRIC` for the simulator buffer, `TARGET_TYPE_PSEUDO_METRIC` for a
             metric estimator. Estimator targets must go through this same call rather than a parallel
             implementation, so the two only ever differ by their label.
+        delta_lag: how many tubelet states the delta spans; 1 is the section 4.1 default. The states
+            are unaffected, so a lag sweep changes only the transition targets.
 
     Returns:
-        `(states, deltas)`: `[B, Tp, V, 1, h, w]` log-depth states and `[B, Tp - 1, V, 1, h, w]`
-        adjacent deltas.
+        `(states, deltas)`: `[B, Tp, V, 1, h, w]` log-depth states and `[B, Tp - delta_lag, V, 1, h, w]`
+        deltas.
     """
     states = log_metric_depth(cache_depth, valid=valid, d_min=d_min, d_max=d_max, target_type=target_type)
     aligned = DepthTarget(
@@ -286,4 +299,4 @@ def build_metric_delta_targets(
     )
     if grid is not None:
         aligned = pool_to_grid(aligned, grid)
-    return aligned, adjacent_delta(aligned)
+    return aligned, lagged_delta(aligned, lag=delta_lag)

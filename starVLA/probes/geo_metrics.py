@@ -21,6 +21,10 @@ Two temporal quantities exist and are not the same thing:
 * `implied_delta_mae` / `temporal_sign_agreement` score the differences *implied* by the state head's
   own consecutive predictions -- are the states it produces temporally coherent at all?
 
+Which elements a metric averages over is as much part of the reading as the formula, so the subset is a
+mask rather than a second metric family: `moving_mask` narrows any mask to the elements that actually
+changed, and every metric above is then computed unchanged over that subset.
+
 Pure tensor math: no filesystem, no model, no logger.
 """
 
@@ -149,6 +153,21 @@ def temporal_sign_agreement(pred: torch.Tensor, target: torch.Tensor, mask: torc
     valid = (mask[:, 1:] & mask[:, :-1]) & (target_change.abs() > TEMPORAL_DEADBAND)
     agree = torch.sign(pred_change) == torch.sign(target_change)
     return _masked_mean(agree.to(pred.dtype), valid)
+
+
+def moving_mask(target: torch.Tensor, mask: torch.Tensor, threshold: float = TEMPORAL_DEADBAND) -> torch.Tensor:
+    """`mask` narrowed to the elements whose target actually moved, i.e. `|target| > threshold`.
+
+    Meant for delta targets. Averaged over every token, a delta metric is dominated by tokens that did
+    not change, and on those a feature-free constant is already exactly right -- so a probe and the
+    constant floor can only be told apart on the subset that moved. This restricts the mask rather than
+    defining new metrics: the same two classes and the same formulas, over fewer elements, so a subset
+    number and a full-token number remain the same quantity and stay comparable.
+
+    The threshold is `temporal_sign_agreement`'s deadband and the comparison is strict, so a change
+    sitting exactly at the threshold is excluded by both.
+    """
+    return mask & (target.abs() > threshold)
 
 
 def align_scale_shift(

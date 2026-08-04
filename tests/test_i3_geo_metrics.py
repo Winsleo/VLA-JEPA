@@ -161,6 +161,65 @@ def test_counts_separate_valid_from_invalid_elements():
 
 
 # --------------------------------------------------------------------------------------
+# the moving subset: the same metrics, over the elements that actually changed
+# --------------------------------------------------------------------------------------
+
+
+def test_the_moving_mask_keeps_only_the_elements_that_changed():
+    target = torch.zeros(SHAPE)
+    target[:, :, :, :, 0, 0] = 0.5  # one grid cell moved, the rest of the scene is static
+    moving = geo_metrics.moving_mask(target, _all_valid())
+    assert int(moving.sum()) == SHAPE[0] * SHAPE[1] * SHAPE[2]
+    assert moving[:, :, :, :, 0, 0].all()
+    assert not moving[:, :, :, :, 1, 1].any()
+
+
+def test_the_moving_mask_cannot_revive_an_invalid_element():
+    """It narrows a mask and never widens one: a moving element with no valid depth stays excluded."""
+    target, mask = torch.full(SHAPE, 0.5), _all_valid()
+    mask[0, 0] = False
+    assert not geo_metrics.moving_mask(target, mask)[0, 0].any()
+    assert geo_metrics.moving_mask(target, mask)[1].all()
+
+
+def test_the_moving_threshold_is_the_sign_agreement_deadband_and_strict():
+    """One threshold for both, so "too small to have a sign" and "did not move" cannot disagree."""
+    at = torch.full(SHAPE, geo_metrics.TEMPORAL_DEADBAND)
+    above = torch.full(SHAPE, geo_metrics.TEMPORAL_DEADBAND * 1.01)
+    assert not geo_metrics.moving_mask(at, _all_valid()).any(), "exactly at the threshold is not moving"
+    assert geo_metrics.moving_mask(above, _all_valid()).all()
+    assert geo_metrics.moving_mask(-above, _all_valid()).all(), "the magnitude decides, not the sign"
+
+
+def test_a_fully_static_target_leaves_an_empty_subset_and_reports_nan():
+    """The empty set is a definition, not a bug: with nothing moving there is nothing to score."""
+    static = torch.full(SHAPE, geo_metrics.TEMPORAL_DEADBAND / 10)
+    moving = geo_metrics.moving_mask(static, _all_valid())
+    assert not moving.any()
+    scores = geo_metrics.metric_depth_metrics(static.clone(), static, moving)
+    assert math.isnan(scores["abs_rel"]) and math.isnan(scores["log_mae"])
+
+
+def test_the_subset_separates_a_predictor_that_only_gets_the_static_part_right():
+    """Why the subset exists (H4): the full-grid average hides a prediction that predicts no change.
+
+    The static predictor is right everywhere nothing moved, so over the whole grid it looks close to
+    the target; on the moving subset it is exactly as wrong as the change it failed to predict.
+    """
+    target = torch.zeros(SHAPE)
+    target[:, :, :, :, 0, 0] = 0.5
+    static_prediction = torch.zeros(SHAPE)
+
+    full = geo_metrics.metric_depth_metrics(static_prediction, target, _all_valid())
+    subset = geo_metrics.metric_depth_metrics(
+        static_prediction, target, geo_metrics.moving_mask(target, _all_valid())
+    )
+    assert full["log_mae"] == pytest.approx(0.5 / (SHAPE[-1] * SHAPE[-2]), abs=1e-6)
+    assert subset["log_mae"] == pytest.approx(0.5, abs=1e-6)
+    assert subset["log_mae"] > 10 * full["log_mae"], "the static background hid the entire error"
+
+
+# --------------------------------------------------------------------------------------
 # the two classes stay separate, and only one of them is gauge-invariant
 # --------------------------------------------------------------------------------------
 

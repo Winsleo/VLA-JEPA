@@ -28,7 +28,11 @@ targets live in their own cache directory, never overwriting the ground-truth on
 
 The fit stage reports two floors next to the arms: the seed spread, which any claimed improvement has
 to clear, and the constant predictors of `geo_probe.constant_baselines`, which say how much of an
-arm's absolute number is the representation rather than a fixed camera looking at a fixed table.
+arm's absolute number is the representation rather than a fixed camera looking at a fixed table. The
+second floor is also reported as a skill score, i.e. each arm's improvement over it, since that is the
+number "did the features help" actually asks for. Delta metrics come in two readings, the whole token
+grid and the subset that moved, because averaged over the whole grid a delta is dominated by tokens
+that did not change and on which the constant floor is exactly right.
 
 Nothing here constructs the Qwen backbone, the action model or the world predictor: the probe path
 instantiates a `VJBackboneAdapter` and (in the fit stage) a probe head, and nothing else
@@ -81,6 +85,18 @@ DEFAULT_CLIP_STRIDE = 1
 # `libero/libero/envs/env_wrapper.py`'s `control_freq = 20`, which the recorder does not override, so
 # one recorded frame is one control step is 0.05 s.
 CONTROL_HZ = 20.0
+
+# Metric classes as they appear in the report, in render order. The moving classes are the same metrics
+# over `geo_metrics.moving_mask`, i.e. the elements that actually changed, and exist for deltas only.
+METRIC_CLASSES = ("metric", "relative")
+MOVING_CLASSES = ("metric_moving", "relative_moving")
+# Splits the probes are scored on. Test keeps the unsuffixed report keys, so readers written before the
+# interval sweep stay valid; val is added because any post-hoc choice has to be made off the test set.
+REPORTED_SPLITS = ("test", "val")
+VAL_SUFFIX = "_val"
+# The floor a skill score is read against: the static scene layout, which is the stronger of the two
+# feature-free predictors and therefore the one a probe has to beat to have used its features at all.
+FLOOR_BASELINE = "per_token_constant"
 
 
 def _git_commit(root: Path) -> str:
@@ -444,36 +460,51 @@ def _probe_inputs(
 
 def _metrics_from(
     predictions: torch.Tensor, data: geo_probe.ProbeInputs, kind: str, target_type: str
-) -> Dict[str, float]:
+) -> Dict[str, Dict[str, float]]:
     """Both metric classes for one set of predictions, flattened into one dict per class prefix.
 
     A delta head predicts transitions only, so state-level metrics have no meaning for it; the delta
     arrays are passed as the states of the evaluation, which `ProbeInputs.target` already selects.
+
+    Deltas are scored a second time over the moving subset. Over every token a delta metric is
+    dominated by tokens that did not change, where a constant predictor is already right, so the two
+    readings answer different questions: "how well is the whole grid predicted" and "how well is the
+    part that moved predicted". Both are reported, neither replaces the other.
     """
     targets, mask = data.target(kind)
-    result = geo_metrics.evaluate(
-        pred_states=predictions.expand_as(targets).contiguous(),
+    predictions = predictions.expand_as(targets).contiguous()
+    scored = geo_metrics.evaluate(
+        pred_states=predictions,
         target_states=targets,
         states_mask=mask,
         target_type=target_type,
     )
-    return {"metric": result.metric, "relative": result.relative, "counts": result.counts}
+    rows = {"metric": scored.metric, "relative": scored.relative, "counts": scored.counts}
+    if kind == "delta":
+        moving = geo_metrics.evaluate(
+            pred_states=predictions,
+            target_states=targets,
+            states_mask=geo_metrics.moving_mask(targets, mask),
+            target_type=target_type,
+        )
+        rows.update(metric_moving=moving.metric, relative_moving=moving.relative, counts_moving=moving.counts)
+    return rows
 
 
-def _metrics_for(head, data: geo_probe.ProbeInputs, kind: str, target_type: str) -> Dict[str, float]:
+def _metrics_for(head, data: geo_probe.ProbeInputs, kind: str, target_type: str) -> Dict[str, Dict[str, float]]:
     return _metrics_from(geo_probe.predict(head, data, kind), data, kind, target_type)
 
 
 def _baselines_for(
-    train: geo_probe.ProbeInputs, test: geo_probe.ProbeInputs, kind: str, target_type: str
+    train: geo_probe.ProbeInputs, scored: geo_probe.ProbeInputs, kind: str, target_type: str
 ) -> Dict[str, Dict[str, float]]:
-    """The feature-free floor, fitted on train and scored on test exactly like the probes.
+    """The feature-free floor, fitted on train and scored on `scored` exactly like the probes.
 
     Computed once rather than per arm: these predictors never touch the features, so every arm would
     produce the same numbers on the same splits.
     """
     return {
-        name: _metrics_from(prediction, test, kind, target_type)
+        name: _metrics_from(prediction, scored, kind, target_type)
         for name, prediction in geo_probe.constant_baselines(train, kind).items()
     }
 
@@ -481,14 +512,38 @@ def _baselines_for(
 def _summarise(seed_runs: List[Dict]) -> Dict[str, Dict[str, float]]:
     """Mean and seed spread per metric. The spread is the noise floor any claim must clear."""
     summary: Dict[str, Dict[str, float]] = {}
-    for metric_class in ("metric", "relative"):
-        names = seed_runs[0][metric_class].keys()
+    for metric_class in METRIC_CLASSES + MOVING_CLASSES:
+        if metric_class not in seed_runs[0]:
+            continue  # the moving classes are emitted for the delta kind only
         summary[metric_class] = {}
-        for name in names:
+        for name in seed_runs[0][metric_class]:
             values = np.array([run[metric_class][name] for run in seed_runs], dtype=np.float64)
             summary[metric_class][name] = float(values.mean())
             summary[metric_class][f"{name}_std"] = float(values.std(ddof=1)) if values.size > 1 else 0.0
     return summary
+
+
+def _floor_skill(summary: Dict[str, Dict[str, float]], floor: Dict[str, Dict[str, float]]) -> Dict:
+    """Each metric's improvement over the feature-free floor, class by class.
+
+    The direct reading of "did the representation contribute anything at all": an arm's absolute delta
+    error means nothing until it is put next to a predictor that never saw a feature. Reuses
+    `geo_metrics.relative_improvement`, so this introduces no second notion of improvement and a metric
+    whose better direction is undeclared raises instead of being scored the wrong way round.
+
+    Metric names are taken from the floor because it carries no `_std` keys; both dicts come from the
+    same `_metrics_from` call shape, so the names line up by construction.
+    """
+    skill: Dict[str, Dict[str, float]] = {}
+    for metric_class in METRIC_CLASSES + MOVING_CLASSES:
+        names = floor.get(metric_class) or {}
+        if not names or metric_class not in summary:
+            continue
+        skill[metric_class] = {
+            name: geo_metrics.relative_improvement(value, summary[metric_class][name], name)
+            for name, value in names.items()
+        }
+    return skill
 
 
 def _delta_interval(targets: probe_cache.TargetCache) -> Dict:
@@ -526,7 +581,8 @@ def run_fit(args: argparse.Namespace) -> None:
     )
 
     results: Dict[str, Dict] = {}
-    baselines: Dict[str, Dict] = {}
+    # Split -> kind -> predictor name. The floor is the same on every arm, so it is computed once.
+    baselines: Dict[str, Dict[str, Dict]] = {split: {} for split in REPORTED_SPLITS}
     for name in args.arms:
         cache = probe_cache.FeatureCache.open(probe_cache.features_dir(args.out, name))
         if cache.grid != grid:
@@ -551,18 +607,23 @@ def run_fit(args: argparse.Namespace) -> None:
 
         arm_results: Dict[str, Dict] = {}
         for kind in args.kinds:
-            if kind not in baselines:
-                baselines[kind] = _baselines_for(splits["train"], splits["test"], kind, targets.target_type)
+            for split in REPORTED_SPLITS:
+                if kind not in baselines[split]:
+                    baselines[split][kind] = _baselines_for(
+                        splits["train"], splits[split], kind, targets.target_type
+                    )
             in_dim = geo_probe.head_input_dim(splits["train"].hidden_size, kind)
             # The firewall, stated in the run log: the teacher contributes no trainable parameter and
             # is never handed to an optimiser (`tests/test_i3_probe_firewall.py`).
             print(f"  {kind} probe: {in_dim + 1} trainable parameters, teacher 0", flush=True)
-            seed_runs, seed_details = [], []
+            seed_runs: Dict[str, List[Dict]] = {split: [] for split in REPORTED_SPLITS}
+            seed_details = []
             for seed in args.seeds:
                 started = time.time()
                 fitted = geo_probe.fit_sgd(splits["train"], splits["val"], kind, seed, config, args.device)
                 head = geo_probe.load_head(fitted["state_dict"], in_dim, args.device)
-                seed_runs.append(_metrics_for(head, splits["test"], kind, targets.target_type))
+                for split in REPORTED_SPLITS:
+                    seed_runs[split].append(_metrics_for(head, splits[split], kind, targets.target_type))
                 seed_details.append(
                     {"seed": seed, "lr": fitted["lr"], "epoch": fitted["epoch"], "val_loss": fitted["val_loss"]}
                 )
@@ -574,10 +635,20 @@ def run_fit(args: argparse.Namespace) -> None:
 
             ridge = geo_probe.fit_ridge(splits["train"], splits["val"], kind, config, args.device)
             ridge_head = geo_probe.load_head(ridge["state_dict"], in_dim, args.device)
+            summaries = {split: _summarise(runs) for split, runs in seed_runs.items()}
+            skills = {
+                split: _floor_skill(summaries[split], baselines[split][kind][FLOOR_BASELINE])
+                for split in REPORTED_SPLITS
+            }
             arm_results[kind] = {
-                "summary": _summarise(seed_runs),
+                # Test under the plain keys, val under `*_val`: see `REPORTED_SPLITS`.
+                "summary": summaries["test"],
+                f"summary{VAL_SUFFIX}": summaries["val"],
                 "seeds": seed_details,
-                "per_seed": seed_runs,
+                "per_seed": seed_runs["test"],
+                f"per_seed{VAL_SUFFIX}": seed_runs["val"],
+                "floor_skill": skills["test"],
+                f"floor_skill{VAL_SUFFIX}": skills["val"],
                 "head_parameters": in_dim + 1,
                 "ridge_secondary": {
                     "ridge": ridge["ridge"],
@@ -585,6 +656,13 @@ def run_fit(args: argparse.Namespace) -> None:
                     **_metrics_for(ridge_head, splits["test"], kind, targets.target_type),
                 },
             }
+            for metric_class, scores in skills["test"].items():
+                if geo_probe.SELECTION_METRIC in scores:
+                    print(
+                        f"  {kind} {metric_class} {geo_probe.SELECTION_METRIC} vs {FLOOR_BASELINE}: "
+                        f"{scores[geo_probe.SELECTION_METRIC] * 100:+.2f}%",
+                        flush=True,
+                    )
 
         # `correct_view_fusion` and `encode_batch_size` travel with the numbers: a cache extracted
         # through upstream's batch>1 fusion scrambles clips against views, and the report is the only
@@ -605,6 +683,9 @@ def run_fit(args: argparse.Namespace) -> None:
             "split": "val",
             "criterion": "masked L1 on log depth",
             "primary_metric": geo_probe.SELECTION_METRIC,
+            # Where each split's numbers live. Any comparison made after seeing results -- the delta
+            # interval of the sweep, for one -- has to be made on val, so val is reported too.
+            "reported_splits": {"unsuffixed": "test", VAL_SUFFIX: "val"},
         },
         "fit_config": {
             "lr_grid": list(config.lr_grid),
@@ -617,7 +698,9 @@ def run_fit(args: argparse.Namespace) -> None:
         # directory of reports without re-deriving it from each cache.
         "delta_interval": _delta_interval(targets),
         "arms": results,
-        "baselines": baselines,
+        "baselines": baselines["test"],
+        f"baselines{VAL_SUFFIX}": baselines["val"],
+        "floor_baseline": FLOOR_BASELINE,
         "primary": _primary_comparison(results, args.kinds),
         "provenance": _provenance(args.clips),
     }
@@ -660,6 +743,19 @@ def _primary_comparison(results: Dict[str, Dict], kinds: Sequence[str]) -> Dict:
     }
 
 
+def _moving_share(report: Dict, kind: str) -> str:
+    """`valid moving / valid total` elements for one kind, or an empty string when there is no subset.
+
+    Reported next to every moving-subset table so a strong subset number is never read without the
+    count it was averaged over: at the 2-frame interval most tokens do not move at all.
+    """
+    counts = next((arm["probes"][kind]["per_seed"][0] for arm in report["arms"].values() if kind in arm["probes"]), {})
+    if "counts_moving" not in counts:
+        return ""
+    moving, total = counts["counts_moving"]["states_valid"], counts["counts"]["states_valid"]
+    return f", {moving} of {total} valid elements ({moving / total:.1%})" if total else ""
+
+
 def _markdown(report: Dict) -> str:
     """Results table with the two metric classes kept in separate blocks."""
     source = report.get("estimator") or "simulator"
@@ -673,11 +769,19 @@ def _markdown(report: Dict) -> str:
         rows = {name: arm["probes"][kind]["summary"] for name, arm in report["arms"].items() if kind in arm["probes"]}
         if not rows:
             continue
-        for metric_class in ("metric", "relative"):
-            names = sorted({key for row in rows.values() for key in row[metric_class] if not key.endswith("_std")})
+        for metric_class in METRIC_CLASSES + MOVING_CLASSES:
+            names = sorted(
+                {key for row in rows.values() for key in row.get(metric_class, {}) if not key.endswith("_std")}
+            )
             if not names:
                 continue
-            lines += [f"**{kind} probe, {metric_class} class** (mean +- seed std over {len(report['seeds'])} seeds)", ""]
+            label = metric_class.removesuffix("_moving") + " class"
+            if metric_class in MOVING_CLASSES:
+                label += (
+                    f", moving subset only (|target| > {geo_metrics.TEMPORAL_DEADBAND}"
+                    f"{_moving_share(report, kind)})"
+                )
+            lines += [f"**{kind} probe, {label}** (mean +- seed std over {len(report['seeds'])} seeds)", ""]
             lines.append("| arm | " + " | ".join(names) + " |")
             lines.append("|---|" + "---|" * len(names))
             for name in sorted(rows):

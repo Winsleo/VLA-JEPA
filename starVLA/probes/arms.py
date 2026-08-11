@@ -39,14 +39,28 @@ from pathlib import Path
 from typing import Mapping, Optional, Tuple
 
 from starVLA.model.modules.world_model.spatial_token_resampler import SpatialTokenResampler
+from starVLA.model.modules.world_model.teacher_loader import (
+    SHORTEST_EDGE,
+    TEACHER_VJEPA2,
+    TEACHER_VJEPA21,
+    load_teacher,
+)
 from starVLA.model.modules.world_model.vj_backbone_adapter import VJBackboneAdapter
 
-TEACHER_VJEPA2 = "vjepa2"
-TEACHER_VJEPA21 = "vjepa21"
-
-# Shortest edge each resolution resizes to before the square centre crop. Both keep the crop ratio
-# the pinned V-JEPA 2 processor uses, which is what makes the arms comparable at all.
-SHORTEST_EDGE = {256: 292, 384: 438}
+# Teacher ids and the crop ratios live in `world_model.teacher_loader` because I4 loads the same two
+# teachers from the training framework. Re-exported here so every probe call site keeps reading them
+# off the arm registry, which is the table that pre-registers them.
+__all__ = [
+    "ARMS",
+    "PRIMARY_METRIC",
+    "PRIMARY_PAIR",
+    "ProbeArm",
+    "SHORTEST_EDGE",
+    "TEACHER_VJEPA2",
+    "TEACHER_VJEPA21",
+    "arm_by_name",
+    "build_adapter",
+]
 
 
 @dataclass(frozen=True)
@@ -122,29 +136,15 @@ def build_adapter(
         An adapter whose `grid_size` is the arm's published grid. The encoder is already frozen and
         in `eval()` by `VJBackboneAdapter.__init__`.
     """
-    root = Path(weights[arm.teacher])
-    if not root.exists():
-        raise FileNotFoundError(f"arm {arm.name}: missing {arm.teacher} weights at {root}")
-
-    if arm.teacher == TEACHER_VJEPA2:
-        from transformers import AutoModel, AutoVideoProcessor
-
-        encoder = AutoModel.from_pretrained(root).to(device)
-        # The pinned processor as published, so arm A stays exactly the I2-measured path.
-        processor = AutoVideoProcessor.from_pretrained(root)
-    elif arm.teacher == TEACHER_VJEPA21:
-        from transformers import VJEPA2VideoProcessor
-
-        from starVLA.model.modules.world_model.vjepa21 import VJEPA21Config, VJEPA21Model
-
-        config = VJEPA21Config.from_pretrained(root)
-        encoder = VJEPA21Model.from_pretrained(root, config=config).to(device)
-        processor = VJEPA2VideoProcessor(
-            size={"shortest_edge": arm.shortest_edge},
-            crop_size={"height": arm.input_size, "width": arm.input_size},
+    try:
+        encoder, processor = load_teacher(
+            teacher=arm.teacher,
+            root=Path(weights[arm.teacher]),
+            input_size=arm.input_size,
+            device=device,
         )
-    else:
-        raise ValueError(f"arm {arm.name}: unknown teacher {arm.teacher!r}")
+    except (FileNotFoundError, ValueError) as error:
+        raise type(error)(f"arm {arm.name}: {error}") from error
 
     native = arm.input_size // encoder.config.patch_size
     return VJBackboneAdapter(

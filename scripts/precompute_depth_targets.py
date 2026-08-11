@@ -40,6 +40,24 @@ trustworthy (the wrist camera's AbsRel exceeds 0.7). `docs/provenance/upstream-c
 the table, the decision and that boundary; the audit's unaligned `metric_raw` block keeps the number
 visible rather than assuming it.
 
+Two input sources feed the same estimator loop, selected by `--source`:
+
+    clips    the I3 recorded clip cache (`--clips`), 8-frame clips with recorded intrinsics. This is
+             the path the I3 bake-off ran on; adding the `lerobot` source did not change it.
+    lerobot  the I4 training set (`--lerobot-root`), one inference per (episode, view) over the whole
+             episode. Added for I4: the training set carries no depth, so the transition target has to
+             be estimated over the very frames the trainer decodes.
+
+Only the *input adapter* differs. Backend, canonical-to-metric conversion, resolution reduction,
+provenance and resume behaviour are shared, so a pseudo depth map means the same thing on both.
+
+"Did not change it" is deliberately not "bit-for-bit identical": the DA3 forward is not bitwise
+deterministic on this GPU. Recomputing three I3 clips twice with *unmodified* code reproduced two of
+them exactly and differed on the third by one pixel out of 1,048,576 (4.883e-04 m, one float16 step
+at that magnitude). That non-determinism predates this file's source refactor and is a property of
+the estimator, not of the cache contract -- I3 gate (b) asserts the *target* maths is reproducible
+from a fixed depth cache, which is a separate claim and still holds.
+
 Usage (see `docs/provenance/environment.md` for the env):
 
     /vepfs/wangshilong/envs/da3/bin/python scripts/precompute_depth_targets.py \
@@ -47,6 +65,13 @@ Usage (see `docs/provenance/environment.md` for the env):
         --weights /vepfs/wangshilong/models/dynaweave/depth_estimators/DA3METRIC-LARGE \
         --clips /vepfs/wangshilong/data/dynaweave/i3_geo_clips \
         --out /vepfs/wangshilong/data/dynaweave/i3_pseudo_depth
+
+    /vepfs/wangshilong/envs/da3/bin/python scripts/precompute_depth_targets.py \
+        --source lerobot \
+        --estimator DA3METRIC-LARGE \
+        --weights /vepfs/wangshilong/models/dynaweave/depth_estimators/DA3METRIC-LARGE \
+        --lerobot-root /vepfs/wangshilong/data/dynaweave/LEROBOT_LIBERO_DATA \
+        --out /vepfs/wangshilong/data/dynaweave/i4_pseudo_depth
 """
 
 import argparse
@@ -57,7 +82,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -87,26 +112,13 @@ DA3_CANONICAL_FOCAL = 300.0
 
 
 # --------------------------------------------------------------------------------------
-# clip cache reading (the minimum duplicated from `starVLA/dataloader/depth_cache_dataset.py`)
+# input sources
 # --------------------------------------------------------------------------------------
-
-def load_manifest(clips: Path) -> List[dict]:
-    """Every recorded clip, ordered by path so this cache's rows match the probe cache's rows."""
-    rows: List[dict] = []
-    for manifest in sorted(clips.glob(MANIFEST_GLOB)):
-        for line in manifest.read_text().splitlines():
-            if line.strip():
-                rows.append(json.loads(line))
-    if not rows:
-        raise SystemExit(f"no {MANIFEST_GLOB} rows under {clips}")
-    return sorted(rows, key=lambda row: row["path"])
-
-
-def load_rgb(clip_path: Path) -> np.ndarray:
-    """`[T, V, H, W, 3]` uint8, exactly as recorded -- no flip, crop or resize is applied here."""
-    with np.load(clip_path) as clip:
-        return np.ascontiguousarray(clip["rgb"])
-
+#
+# A source answers three questions and nothing else: which units of work exist, where each one's
+# output file goes, and how to load one unit's `([T, V, H, W, 3] uint8 RGB, per-view focal)`. Keeping
+# it that narrow is what lets the estimator loop below stay identical for both, which is the property
+# that makes an I3 pseudo depth map and an I4 pseudo depth map the same kind of number.
 
 def read_index(out: Path) -> Dict[str, object]:
     """The index of a partially built cache, or `{}` when there is none yet."""
@@ -114,15 +126,178 @@ def read_index(out: Path) -> Dict[str, object]:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def episode_focals(clip_path: Path) -> List[float]:
-    """Per-view focal length in pixels of the recorded grid, in the cache's view order.
+class ClipCacheSource:
+    """The I3 recorded clip cache: 8-frame clips with the recorder's own intrinsics.
 
-    Read from the episode's `meta.json`, which the recorder writes next to its clips. The average of
-    `f_x` and `f_y` matches what `apply_metric_scaling` uses upstream; for LIBERO the two are equal.
+    The manifest reading and RGB loading are the minimum duplicated from
+    `starVLA/dataloader/depth_cache_dataset.py` -- see the module docstring for why this file cannot
+    import starVLA.
     """
-    meta = json.loads((clip_path.parent / EPISODE_META).read_text())
-    intrinsics = meta["intrinsics"]
-    return [0.5 * (intrinsics[view][0][0] + intrinsics[view][1][1]) for view in meta["views"]]
+
+    name = "clips"
+    unit = "clip"
+
+    def __init__(self, clips: Path) -> None:
+        self.clips = clips
+        rows: List[dict] = []
+        for manifest in sorted(clips.glob(MANIFEST_GLOB)):
+            for line in manifest.read_text().splitlines():
+                if line.strip():
+                    rows.append(json.loads(line))
+        if not rows:
+            raise SystemExit(f"no {MANIFEST_GLOB} rows under {clips}")
+        # Ordered by path so this cache's rows match the probe cache's rows.
+        self.keys: List[str] = [row["path"] for row in sorted(rows, key=lambda row: row["path"])]
+
+    def destination(self, key: str, out: Path) -> Path:
+        return out / key
+
+    def load(self, key: str) -> Tuple[np.ndarray, List[float]]:
+        clip_path = self.clips / key
+        with np.load(clip_path) as clip:
+            # Exactly as recorded -- no flip, crop or resize is applied here.
+            rgb = np.ascontiguousarray(clip["rgb"])  # [T, V, H, W, 3]
+        # The average of `f_x` and `f_y` matches what `apply_metric_scaling` uses upstream; for LIBERO
+        # the two are equal.
+        meta = json.loads((clip_path.parent / EPISODE_META).read_text())
+        intrinsics = meta["intrinsics"]
+        focals = [0.5 * (intrinsics[view][0][0] + intrinsics[view][1][1]) for view in meta["views"]]
+        return rgb, focals
+
+    def provenance(self) -> Dict[str, object]:
+        return {"source": self.name, "clip_cache": str(self.clips)}
+
+
+# LIBERO's cameras are fixed and its renders are all 256 wide, so the focal is a per-camera constant
+# rather than per-episode metadata -- which is just as well, because the LeRobot conversion kept no
+# intrinsics at all. Measured, not assumed: all 200 I3 recording episodes report byte-identical
+# matrices (`f_x == f_y`, principal point 128), and both datasets render the same two LIBERO cameras
+# at the same 256x256 (`agentview` -> `observation.images.image`, `robot0_eye_in_hand` ->
+# `observation.images.wrist_image`).
+#
+# What rides on these numbers is smaller than it looks. They only enter through
+# `canonical_to_metric`, i.e. as one constant factor per camera, and I4's target is a *delta of log
+# depth* -- `log(a*d2) - log(a*d1)` drops `a` exactly. So the constants affect only which pixels fall
+# inside the `[d_min, d_max]` clip, never the supervised signal. D-048's standing warning that this
+# estimator's absolute scale is not trustworthy therefore does not propagate into the I4 target.
+LEROBOT_FOCALS = {
+    "observation.images.image": 309.01933598375615,
+    "observation.images.wrist_image": 166.81284772367434,
+}
+LEROBOT_FOCAL_WIDTH = 256
+# View order, which must match `Libero4in1DataConfig.video_keys` (`primary_image`, `wrist_image`) so
+# that axis `V` of the cache means the same camera as axis `V` of the trainer's video batch.
+LEROBOT_VIEW_KEYS: Tuple[str, ...] = ("observation.images.image", "observation.images.wrist_image")
+
+
+def decode_episode_video(path: str) -> np.ndarray:
+    """One episode's frames as `[T, H, W, 3]` uint8, decoded the way the trainer decodes them.
+
+    `starVLA/dataloader/lerobot_datasets.py` pins `video_backend="torchvision_av"`, so the frames the
+    model sees come from `torchvision.io.VideoReader` on the pyav backend. This reads the same reader
+    straight through instead of re-seeking per timestamp: measured over 4 suites x 3 episodes x 2
+    views, a sequential pass is **byte-identical** to the trainer's per-timestamp seek and yields
+    exactly `episodes.jsonl`'s `length` frames, so frame `i` here is frame `i` there. That equality is
+    what makes an absolute frame index a valid cache key; `tests/test_i4_depth_alignment.py` keeps it
+    honest. Decord is *not* used -- neither environment's build can open these AV1 streams.
+    """
+    import torchvision
+
+    torchvision.set_video_backend("pyav")
+    reader = torchvision.io.VideoReader(path, "video")
+    frames = [frame["data"].cpu().numpy() for frame in reader]
+    if not frames:
+        raise SystemExit(f"decoded no frames from {path}")
+    return np.stack(frames).transpose(0, 2, 3, 1)  # [T, C, H, W] -> [T, H, W, 3]
+
+
+class LeRobotSource:
+    """The I4 training set: one unit of work per episode, all views together.
+
+    Unlike the clip cache there is no manifest, so the work list is `meta/episodes.jsonl` per dataset
+    and the video path template comes from `meta/info.json` rather than being hardcoded. Episode
+    length is cross-checked against the decoded frame count instead of trusted, because a silent
+    truncation here would shift every depth frame relative to its RGB frame.
+    """
+
+    name = "lerobot"
+    unit = "episode"
+
+    def __init__(self, root: Path, datasets: Optional[Sequence[str]] = None) -> None:
+        self.root = root
+        names = sorted(path.name for path in root.iterdir() if (path / "meta" / "info.json").is_file())
+        if datasets is not None:
+            missing = sorted(set(datasets) - set(names))
+            if missing:
+                raise SystemExit(f"no such dataset(s) under {root}: {missing}")
+            names = [name for name in names if name in datasets]
+        if not names:
+            raise SystemExit(f"no LeRobot datasets under {root}")
+        self.datasets = names
+        self._info = {name: json.loads((root / name / "meta" / "info.json").read_text()) for name in names}
+        self._lengths: Dict[str, int] = {}
+        self.keys: List[str] = []
+        for name in names:
+            lines = (root / name / "meta" / "episodes.jsonl").read_text().splitlines()
+            for line in lines:
+                if not line.strip():
+                    continue
+                episode = json.loads(line)
+                key = f"{name}/episode_{episode['episode_index']:06d}.npz"
+                self._lengths[key] = int(episode["length"])
+                self.keys.append(key)
+
+    def destination(self, key: str, out: Path) -> Path:
+        return out / key
+
+    def _video_path(self, dataset: str, episode_index: int, view_key: str) -> str:
+        info = self._info[dataset]
+        return (
+            self.root
+            / dataset
+            / info["video_path"].format(
+                episode_chunk=episode_index // info["chunks_size"],
+                video_key=view_key,
+                episode_index=episode_index,
+            )
+        ).as_posix()
+
+    def load(self, key: str) -> Tuple[np.ndarray, List[float]]:
+        dataset, stem = key.split("/", 1)
+        episode_index = int(stem[len("episode_") : -len(".npz")])
+        views = [decode_episode_video(self._video_path(dataset, episode_index, view)) for view in LEROBOT_VIEW_KEYS]
+        expected = self._lengths[key]
+        for view_key, frames in zip(LEROBOT_VIEW_KEYS, views):
+            if frames.shape[0] != expected:
+                raise SystemExit(
+                    f"{key} {view_key}: decoded {frames.shape[0]} frames, episodes.jsonl says {expected}"
+                )
+        rgb = np.stack(views, axis=1)  # [T, V, H, W, 3]
+        return rgb, [LEROBOT_FOCALS[view] for view in LEROBOT_VIEW_KEYS]
+
+    def provenance(self) -> Dict[str, object]:
+        return {
+            "source": self.name,
+            "lerobot_root": str(self.root),
+            "datasets": self.datasets,
+            "view_keys": list(LEROBOT_VIEW_KEYS),
+            "video_backend": "torchvision.io.VideoReader (pyav), read sequentially",
+            "focals": dict(LEROBOT_FOCALS),
+            "focal_width": LEROBOT_FOCAL_WIDTH,
+            "focal_provenance": (
+                "per-camera constants; LIBERO's cameras are fixed and all 200 I3 recording episodes"
+                " report byte-identical intrinsics at 256x256. They enter only as one constant factor"
+                " per camera in canonical_to_metric and therefore cancel in a log-depth delta."
+            ),
+        }
+
+
+def build_source(args: argparse.Namespace) -> object:
+    if args.source == "clips":
+        return ClipCacheSource(args.clips)
+    if args.source == "lerobot":
+        return LeRobotSource(args.lerobot_root, args.datasets)
+    raise SystemExit(f"unknown source {args.source!r}")
 
 
 def canonical_to_metric(depth: np.ndarray, focal_recorded: float, recorded_width: int) -> np.ndarray:
@@ -349,24 +524,23 @@ def weight_provenance(weights: Path, hf_revision: Optional[str] = None) -> Dict[
 # main loop
 # --------------------------------------------------------------------------------------
 
-def clip_jobs(
-    rows: List[dict],
-    clips: Path,
+def pending_jobs(
+    source: object,
+    keys: Sequence[str],
     out: Path,
     overwrite: bool,
     limit: Optional[int] = None,
-) -> Iterator[Tuple[dict, Path, Path]]:
-    """Clips still to compute. Already-written clips are skipped, which makes a run resumable."""
+) -> Iterator[Tuple[str, Path]]:
+    """Units still to compute. Already-written ones are skipped, which makes a run resumable."""
     yielded = 0
-    for row in rows:
+    for key in keys:
         if limit is not None and yielded >= limit:
             return
-        source = clips / row["path"]
-        destination = out / row["path"]
+        destination = source.destination(key, out)
         if destination.exists() and not overwrite:
             continue
         yielded += 1
-        yield row, source, destination
+        yield key, destination
 
 
 def run(args: argparse.Namespace) -> None:
@@ -377,13 +551,14 @@ def run(args: argparse.Namespace) -> None:
     # manifest, so a strided cache reports itself incomplete instead of redefining "complete".
     # `--offset` shifts the start, so `--stride n` with offsets 0..n-1 shards one cache across n GPUs
     # without two workers picking the same clip.
-    manifest = load_manifest(args.clips)
-    rows = manifest[args.offset :: args.stride]
+    source = build_source(args)
+    all_keys = source.keys
+    keys = all_keys[args.offset :: args.stride]
     out = args.out / args.estimator
     out.mkdir(parents=True, exist_ok=True)
 
     backend = build_backend(args)
-    print(f"{args.estimator}: {len(rows)} of {len(manifest)} clips -> {out}", flush=True)
+    print(f"{args.estimator}: {len(keys)} of {len(all_keys)} {source.unit}s -> {out}", flush=True)
 
     # Two separate facts, never merged: what the model itself claimed, and whether this script had to
     # perform the canonical-to-metric multiplication to reach metres. Both describe the *cache*, not
@@ -393,10 +568,9 @@ def run(args: argparse.Namespace) -> None:
     self_metric_seen = set(previous.get("model_reported_metric", []))
     converted_seen = set(previous.get("canonical_conversion_applied", []))
     written, started = 0, time.time()
-    for _row, source, destination in clip_jobs(rows, args.clips, out, args.overwrite, args.limit):
-        rgb = load_rgb(source)  # [T, V, H, W, 3]
+    for key, destination in pending_jobs(source, keys, out, args.overwrite, args.limit):
+        rgb, focals = source.load(key)  # [T, V, H, W, 3], one focal per view
         num_frames, num_views, height, width = rgb.shape[:4]
-        focals = episode_focals(source)
 
         depths, confs = [], []
         for view in range(num_views):
@@ -422,15 +596,16 @@ def run(args: argparse.Namespace) -> None:
         written += 1
         if written % 50 == 0:
             rate = written / (time.time() - started)
-            print(f"  {written} clips ({rate:.2f}/s, {num_frames}x{num_views} frames each)", flush=True)
+            print(f"  {written} {source.unit}s ({rate:.2f}/s, last {num_frames}x{num_views} frames)", flush=True)
 
     # A resumed or `--limit`ed run must not overwrite a finished index with an empty-looking one, so
-    # `is_metric` / `has_conf` fall back to a clip already on disk and `complete` says which it is.
-    present = sum(1 for row in manifest if (out / row["path"]).exists())
+    # `is_metric` / `has_conf` fall back to a unit already on disk and `complete` says which it is.
+    written_keys = [key for key in all_keys if source.destination(key, out).exists()]
+    present = len(written_keys)
     if written:
         has_conf = "conf" in payload
     elif present:
-        with np.load(out / next(row["path"] for row in manifest if (out / row["path"]).exists())) as clip:
+        with np.load(source.destination(written_keys[0], out)) as clip:
             has_conf = "conf" in clip.files
     else:
         has_conf = None
@@ -450,15 +625,15 @@ def run(args: argparse.Namespace) -> None:
         "has_conf": has_conf,
         "depth_dtype": np.dtype(DEPTH_DTYPE).name,
         "resize_to_cache": "torch area interpolation back to the recorded 256x256 grid",
-        "per_inference_unit": "one call per (clip, view): all frames of one camera in one forward",
-        "num_clips": len(manifest),
+        "per_inference_unit": f"one call per ({source.unit}, view): all frames of one camera in one forward",
+        "num_clips": len(all_keys),
         "num_written": written,
         "num_present": present,
         "stride": args.stride,
         "offset": args.offset,
-        "complete": present == len(manifest),
-        "clip_cache": str(args.clips),
-        "paths": [row["path"] for row in manifest],
+        "complete": present == len(all_keys),
+        **source.provenance(),
+        "paths": list(all_keys),
         "weights": (
             weight_provenance(args.weights, args.hf_revision)
             if args.weights.is_dir()
@@ -469,7 +644,7 @@ def run(args: argparse.Namespace) -> None:
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     (out / ESTIMATOR_INDEX).write_text(json.dumps(index, indent=2, sort_keys=True) + "\n")
-    print(f"{args.estimator}: wrote {written} clips, index -> {out / ESTIMATOR_INDEX}", flush=True)
+    print(f"{args.estimator}: wrote {written} {source.unit}s, index -> {out / ESTIMATOR_INDEX}", flush=True)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -483,7 +658,25 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=Path("/vepfs/wangshilong/third_party/Video-Depth-Anything"),
         help="Video-Depth-Anything checkout (video_depth_anything backend only)",
     )
+    parser.add_argument(
+        "--source",
+        choices=("clips", "lerobot"),
+        default="clips",
+        help="input adapter: the I3 clip cache (default, unchanged) or the I4 LeRobot training set",
+    )
     parser.add_argument("--clips", type=Path, default=Path("/vepfs/wangshilong/data/dynaweave/i3_geo_clips"))
+    parser.add_argument(
+        "--lerobot-root",
+        type=Path,
+        default=Path("/vepfs/wangshilong/data/dynaweave/LEROBOT_LIBERO_DATA"),
+        help="root holding one directory per LeRobot dataset (lerobot source only)",
+    )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        help="restrict the lerobot source to these dataset directories; default is all of them",
+    )
     parser.add_argument("--out", type=Path, default=Path("/vepfs/wangshilong/data/dynaweave/i3_pseudo_depth"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true", help="recompute clips that already have a file")

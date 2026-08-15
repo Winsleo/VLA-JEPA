@@ -173,8 +173,11 @@ class VLATrainer(TrainerUtils):
                 self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
             )
             self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
-        if self.config.framework.vj2_model.get("reinit_predictor", False):
-            self.model.reinitialize_world_predictor()
+            # Full loads reset in VLA_JEPA.load_state_dict(). Partial loads intentionally bypass
+            # that method so the swapped I4 teacher can retain its initializer while the other
+            # checkpoint modules are restored.
+            if self.config.framework.vj2_model.get("reinit_predictor", False) and reload_modules:
+                self.model.reinitialize_world_predictor()
 
         # freeze parameters
         freeze_modules = (

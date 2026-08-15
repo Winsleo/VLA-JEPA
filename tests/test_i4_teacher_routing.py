@@ -68,3 +68,25 @@ def test_framework_uses_the_shared_loader_and_resets_after_super_load():
     )
     reset = next(node for node in ast.walk(method) if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "reinitialize_predictor")
     assert super_load.lineno < reset.lineno
+
+
+def test_trainer_only_resets_after_a_partial_checkpoint_load():
+    """A full load resets in VLA_JEPA; partial loading bypasses that method."""
+    source = Path(__file__).parents[1] / "starVLA" / "training" / "train_starvla.py"
+    tree = ast.parse(source.read_text())
+    method = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "prepare_training" and node.args.args[0].arg == "self"
+    )
+    resets = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "reinitialize_world_predictor"
+    ]
+    assert len(resets) == 1
+    reset = resets[0]
+    parents = [node for node in ast.walk(method) if isinstance(node, ast.If) and reset in ast.walk(node)]
+    assert any("reload_modules" in ast.unparse(parent.test) for parent in parents)

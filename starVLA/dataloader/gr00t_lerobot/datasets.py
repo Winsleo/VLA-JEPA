@@ -1397,6 +1397,9 @@ class LeRobotMixtureDataset(Dataset):
         resolution_size: int = 224,
         video_resolution_size: int = 256,
         seed: int = 42,
+        depth_cache_root: str | Path | None = None,
+        depth_state_cache_root: str | Path | None = None,
+        depth_cache_estimator: str = "DA3METRIC-LARGE",
         metadata_config: dict = {
             "percentile_mixing_method": "min_max",
         },
@@ -1432,6 +1435,9 @@ class LeRobotMixtureDataset(Dataset):
         self.with_state = with_state
         self.resolution_size = resolution_size
         self.video_resolution_size = video_resolution_size
+        self.depth_cache_root = Path(depth_cache_root) if depth_cache_root else None
+        self.depth_state_cache_root = Path(depth_state_cache_root) if depth_state_cache_root else None
+        self.depth_cache_estimator = depth_cache_estimator
 
         # Set properties for sampling
 
@@ -1592,6 +1598,60 @@ class LeRobotMixtureDataset(Dataset):
         
         return resized_video
 
+    def _load_depth(self, dataset: LeRobotSingleDataset, trajectory_name: int, step: int) -> np.ndarray:
+        """Load the same episode frames used by the 8-frame RGB observation window."""
+        if self.depth_cache_root is None:
+            raise RuntimeError("depth cache requested without depth_cache_root")
+        path = self.depth_cache_root / self.depth_cache_estimator / dataset.dataset_name / (
+            f"episode_{int(trajectory_name):06d}.npz"
+        )
+        if not path.is_file():
+            raise FileNotFoundError(f"missing depth cache for {dataset.dataset_name}/{trajectory_name}: {path}")
+        with np.load(path) as cache:
+            depth = np.asarray(cache["depth_m"], dtype=np.float32)  # [T,V,H,W]
+        offsets = dataset.delta_indices[dataset.modality_keys["video"][0]]
+        indices = np.clip(int(step) + offsets, 0, depth.shape[0] - 1)
+        depth = depth[indices]  # [T,V,H,W]
+        if depth.shape[1] < 2:
+            depth = np.repeat(depth, 2, axis=1)
+        # Trainer video order is primary image, wrist image; keep [V,T,1,H,W].
+        return np.ascontiguousarray(depth[:, :2].transpose(1, 0, 2, 3)[:, :, None])
+
+    def _load_depth_states(
+        self, dataset: LeRobotSingleDataset, trajectory_name: int, step: int
+    ) -> dict[str, np.ndarray]:
+        if self.depth_state_cache_root is None:
+            raise RuntimeError("depth state cache requested without depth_state_cache_root")
+        path = self.depth_state_cache_root / self.depth_cache_estimator / dataset.dataset_name / (
+            f"episode_{int(trajectory_name):06d}.npz"
+        )
+        if not path.is_file():
+            raise FileNotFoundError(f"missing depth state cache: {path}")
+        with np.load(path) as cache:
+            states = np.asarray(cache["states"])
+            deltas = np.asarray(cache["deltas"])
+            delta_mask = np.asarray(cache["delta_mask"])
+        # The cache is grouped globally as (0,1), (2,3), ... .  A local 8-frame window beginning at
+        # raw frame `step` therefore starts at the tubelet containing `step + 1`; clamping mirrors
+        # LeRobot's RGB timestamp padding at episode boundaries.
+        state_start = min(max((int(step) + 1) // 2, 0), max(states.shape[0] - 4, 0))
+        delta_start = min(max(state_start, 0), max(deltas.shape[0] - 3, 0))
+        states = states[state_start : state_start + 4]
+        deltas = deltas[delta_start : delta_start + 3]
+        delta_mask = delta_mask[delta_start : delta_start + 3]
+        if states.shape[0] < 4:
+            states = np.concatenate([states, np.repeat(states[-1:], 4 - states.shape[0], axis=0)], axis=0)
+        if deltas.shape[0] < 3:
+            deltas = np.concatenate([deltas, np.repeat(deltas[-1:], 3 - deltas.shape[0], axis=0)], axis=0)
+            delta_mask = np.concatenate(
+                [delta_mask, np.repeat(delta_mask[-1:], 3 - delta_mask.shape[0], axis=0)], axis=0
+            )
+        return {
+            "depth_states": np.ascontiguousarray(states),
+            "depth_targets": np.ascontiguousarray(deltas),
+            "depth_mask": np.ascontiguousarray(delta_mask),
+        }
+
     def __getitem__(self, index: int) -> dict:
         """Get the data for a single trajectory and start index.
 
@@ -1639,6 +1699,10 @@ class LeRobotMixtureDataset(Dataset):
                         state.append(data[state_key])
                     state = np.concatenate(state, axis=1).astype(np.float16)
                     return_dict["state"] = state[0:1]
+                if self.depth_cache_root is not None:
+                    return_dict["depth"] = self._load_depth(dataset, trajectory_name, step)
+                if self.depth_state_cache_root is not None:
+                    return_dict.update(self._load_depth_states(dataset, trajectory_name, step))
                 #print(videos[0].shape) #[horizon, H, W, 3]
                 #print(action.shape) #[horizon, action_dim]
                 #print(images[0]) #PIL.Image
@@ -2139,6 +2203,3 @@ class LeRobotMixtureDataset(Dataset):
                 dataset.set_transforms_metadata(self.merged_metadata[dataset.tag])
         
         print(f"Applied cached statistics for {len(self.merged_metadata)} embodiment tags.")
-
-
-

@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from transformers import AutoVideoProcessor, AutoModel, AutoTokenizer, VJEPA2VideoProcessor
+from transformers import AutoTokenizer
 from omegaconf import OmegaConf
 
 from starVLA.training.trainer_utils import initialize_overwatch
@@ -25,11 +25,22 @@ logger = initialize_overwatch(__name__)
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
+
+def reinitialize_predictor(predictor) -> int:
+    """Reset the I4 world predictor after loading a checkpoint, preserving all other state."""
+    predictor.apply(predictor._init_weights)
+    predictor._rescale_blocks()
+    return sum(parameter.numel() for parameter in predictor.parameters())
+
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 from starVLA.model.modules.world_model.vj_backbone_adapter import VJBackboneAdapter
+from starVLA.model.modules.world_model.teacher_loader import TEACHER_VJEPA2, load_teacher
+from starVLA.model.modules.world_model.depth_targets import build_metric_delta_targets
+from starVLA.model.modules.world_model.depth_delta_head import DepthDeltaHead
+from starVLA.model.modules.world_model.depth_losses import depth_delta_loss
 from starVLA.training.trainer_utils.trainer_tools import METRIC_PREFIX, resize_images
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 
@@ -80,14 +91,23 @@ class VLA_JEPA(baseframework):
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
-        self.vj_encoder = AutoModel.from_pretrained(self.config.framework.vj2_model.base_encoder)
-        self.vj_processor = AutoVideoProcessor.from_pretrained(self.config.framework.vj2_model.base_encoder)
+        teacher_cfg = self.config.framework.vj2_model
+        teacher = teacher_cfg.get("teacher", TEACHER_VJEPA2)
+        teacher_root = teacher_cfg.base_encoder if teacher == TEACHER_VJEPA2 else teacher_cfg.get("teacher_weights")
+        if teacher_root is None:
+            raise ValueError(f"teacher_weights is required for teacher={teacher!r}")
+        self.vj_encoder, self.vj_processor = load_teacher(
+            teacher=teacher,
+            root=teacher_root,
+            input_size=teacher_cfg.get("input_size"),
+        )
         # Owns the frozen-teacher firewall and the patch geometry. Keeps `vj_encoder` as a direct
         # submodule so published checkpoints still load with strict=True.
         self.vj_backbone = VJBackboneAdapter(
             encoder=self.vj_encoder,
             processor=self.vj_processor,
             num_frames=self.config.framework.vj2_model.num_frames,
+            input_size=teacher_cfg.get("input_size"),
             # Off by default: upstream's view fusion is wrong for batch > 1, and the I2 goldens
             # encode it. See the adapter's docstring and docs/provenance/upstream-conflicts.md.
             correct_view_fusion=bool(self.config.framework.vj2_model.get("correct_view_fusion", False)),
@@ -123,6 +143,47 @@ class VLA_JEPA(baseframework):
         loss_scale = self.config.trainer.get("loss_scale", {}) if self.config and self.config.trainer else {}
         self.wm_loss_weight = loss_scale.get("wm", 0.1)
         self.wm_action_free_loss_weight = loss_scale.get("wm_action_free", 1.0)
+        depth_cfg = self.config.framework.get("depth_head", {})
+        self.depth_enabled = bool(depth_cfg.get("enabled", False))
+        self.depth_loss_weight = float(depth_cfg.get("weight", 0.05))
+        self.depth_gradient_weight = float(depth_cfg.get("gradient_weight", 0.5))
+        self.depth_tubelet_size = int(depth_cfg.get("tubelet_size", 2))
+        self.depth_delta_lag = int(depth_cfg.get("delta_lag", 1))
+        self.depth_target_grid = tuple(depth_cfg.get("target_grid", (16, 16)))
+        if self.depth_enabled:
+            if self.depth_tubelet_size != 2 or self.depth_delta_lag != 1:
+                raise ValueError("I4 training depth target is fixed to tubelet_size=2 and delta_lag=1")
+            self.depth_delta_head = DepthDeltaHead(
+                hidden_size=self.qwen_vl_interface.model.config.hidden_size,
+                channels=int(depth_cfg.get("channels", 64)),
+            )
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Load a checkpoint and optionally reset only its world predictor for an I4 cell."""
+        try:
+            result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except RuntimeError:
+            # I4's opt-in depth head is intentionally absent from the pinned I2 checkpoint.  Keep
+            # strict compatibility for every baseline path; only the explicitly enabled auxiliary
+            # branch may bootstrap its new parameters from their initializer.
+            if not (self.depth_enabled and strict):
+                raise
+            result = super().load_state_dict(state_dict, strict=False, assign=assign)
+            logger.info(
+                "Loaded legacy checkpoint with depth head initialized; missing=%s unexpected=%s",
+                result.missing_keys,
+                result.unexpected_keys,
+            )
+        if self.config.framework.vj2_model.get("reinit_predictor", False):
+            count = reinitialize_predictor(self.vj_predictor)
+            logger.info(f"Reinitialized vj_predictor after checkpoint load ({count} parameters)")
+        return result
+
+    def reinitialize_world_predictor(self) -> int:
+        """Reset only the predictor for I4 cells that intentionally swap the frozen teacher."""
+        count = reinitialize_predictor(self.vj_predictor)
+        logger.info(f"Reinitialized vj_predictor ({count} parameters)")
+        return count
 
     def train(self, mode: bool = True):
         """Keep the frozen teacher in eval mode when the parent switches to train (AGENTS.md 6)."""
@@ -263,12 +324,76 @@ class VLA_JEPA(baseframework):
                 gt_states,
                 reduction="mean"
             )
+
+        depth_loss = None
+        depth_metrics = {}
+        has_cached_depth = all(key in examples[0] for key in ("depth_states", "depth_targets", "depth_mask"))
+        has_raw_depth = all("depth" in example for example in examples)
+        if self.depth_enabled and "action" in examples[0] and (has_cached_depth or has_raw_depth):
+            if has_cached_depth:
+                states_values = torch.as_tensor(
+                    np.stack([example["depth_states"] for example in examples]),
+                    device=last_hidden.device, dtype=torch.float32,
+                )
+                target_values = torch.as_tensor(
+                    np.stack([example["depth_targets"] for example in examples]),
+                    device=last_hidden.device, dtype=torch.float32,
+                )
+                target_mask = torch.as_tensor(
+                    np.stack([example["depth_mask"] for example in examples]),
+                    device=last_hidden.device, dtype=torch.bool,
+                )
+            else:
+                depth = torch.as_tensor(
+                    np.stack([example["depth"] for example in examples]),
+                    device=last_hidden.device, dtype=torch.float32,
+                )
+                with torch.no_grad():
+                    state_target, delta_target = build_metric_delta_targets(
+                        depth,
+                        tubelet_size=self.depth_tubelet_size,
+                        grid=self.depth_target_grid,
+                        target_type=self.config.datasets.vla_data.get("depth_target_type", "pseudo_metric"),
+                        delta_lag=self.depth_delta_lag,
+                    )
+                states_values, target_values, target_mask = state_target.values, delta_target.values, delta_target.mask
+            # Three action-token groups condition the three predictor transitions; repeat each
+            # condition over the two camera views without exposing future depth to the policy.
+            groups = self.vj_backbone.num_temporal_blocks - 1
+            if action_tokens.shape[1] % groups:
+                raise ValueError(f"action token count {action_tokens.shape[1]} is not divisible by {groups}")
+            tokens = action_tokens.view(action_tokens.shape[0], groups, -1, action_tokens.shape[-1])
+            current = states_values[:, :-1]
+            target = target_values
+            valid = target_mask
+            batch_size, transitions, views = current.shape[:3]
+            condition = tokens[:, :, None].expand(batch_size, transitions, views, *tokens.shape[2:])
+            predicted_depth = self.depth_delta_head(
+                current.reshape(batch_size * transitions * views, 1, *current.shape[-2:]),
+                condition.reshape(batch_size * transitions * views, *condition.shape[-2:]),
+            )
+            raw_depth_loss, raw_depth_pixel, raw_depth_gradient = depth_delta_loss(
+                predicted_depth,
+                target.reshape(batch_size * transitions * views, 1, *target.shape[-2:]).detach(),
+                valid.reshape(batch_size * transitions * views, 1, *valid.shape[-2:]).detach(),
+                gradient_weight=self.depth_gradient_weight,
+            )
+            depth_loss = raw_depth_loss * self.depth_loss_weight
+            depth_metrics = {
+                f"{METRIC_PREFIX}depth_loss_raw": raw_depth_loss.detach(),
+                f"{METRIC_PREFIX}depth_pixel_l1_raw": raw_depth_pixel.detach(),
+                f"{METRIC_PREFIX}depth_gradient_raw": raw_depth_gradient.detach(),
+                f"{METRIC_PREFIX}depth_loss_weight": torch.as_tensor(
+                    self.depth_loss_weight, device=raw_depth_loss.device, dtype=torch.float32
+                ),
+            }
         
         if "action" not in examples[0]:
             weight = self.wm_action_free_loss_weight
             return {
                 "wm_loss": teacher_forcing_wm_loss * weight,
                 **self._loss_metrics(teacher_forcing_wm_loss, weight),
+                **depth_metrics,
             }
 
         # Step 4: Action Expert Forward and Loss
@@ -303,11 +428,15 @@ class VLA_JEPA(baseframework):
             action_loss = self.action_model(embodied_action_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
 
         weight = self.wm_loss_weight
-        return {
+        losses = {
             "action_loss": action_loss,
             "wm_loss": teacher_forcing_wm_loss * weight,
             **self._loss_metrics(teacher_forcing_wm_loss, weight, action_loss=action_loss),
         }
+        if depth_loss is not None:
+            losses["depth_loss"] = depth_loss
+        losses.update(depth_metrics)
+        return losses
 
     def _loss_metrics(self, wm_loss, wm_weight, action_loss=None):
         """Log-only companions of the returned losses (AGENTS.md section 10, item 8).

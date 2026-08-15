@@ -190,7 +190,11 @@ LEROBOT_FOCAL_WIDTH = 256
 LEROBOT_VIEW_KEYS: Tuple[str, ...] = ("observation.images.image", "observation.images.wrist_image")
 
 
-def decode_episode_video(path: str) -> np.ndarray:
+class EpisodeDecodeError(RuntimeError):
+    """A recoverable decode failure with the episode/view provenance needed for a retry."""
+
+
+def decode_episode_video(path: str, retries: int = 0) -> np.ndarray:
     """One episode's frames as `[T, H, W, 3]` uint8, decoded the way the trainer decodes them.
 
     `starVLA/dataloader/lerobot_datasets.py` pins `video_backend="torchvision_av"`, so the frames the
@@ -204,11 +208,30 @@ def decode_episode_video(path: str) -> np.ndarray:
     import torchvision
 
     torchvision.set_video_backend("pyav")
-    reader = torchvision.io.VideoReader(path, "video")
-    frames = [frame["data"].cpu().numpy() for frame in reader]
-    if not frames:
-        raise SystemExit(f"decoded no frames from {path}")
-    return np.stack(frames).transpose(0, 2, 3, 1)  # [T, C, H, W] -> [T, H, W, 3]
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            reader = torchvision.io.VideoReader(path, "video")
+            frames = []
+            try:
+                frames = [frame["data"].cpu().numpy() for frame in reader]
+            finally:
+                # torchvision's pyav reader otherwise keeps its C++ decoder alive until GC. This
+                # script opens two streams per episode for thousands of episodes, so release it at
+                # the episode boundary rather than allowing native handles to accumulate.
+                if hasattr(reader, "_c"):
+                    reader._c = None
+                container = getattr(reader, "container", None)
+                if container is not None:
+                    container.close()
+            if not frames:
+                raise EpisodeDecodeError(f"decoded no frames from {path}")
+            return np.stack(frames).transpose(0, 2, 3, 1)  # [T, C, H, W] -> [T, H, W, 3]
+        except Exception as error:
+            last_error = error
+            if attempt < retries:
+                time.sleep(0.25 * (attempt + 1))
+    raise EpisodeDecodeError(f"failed to decode {path} after {retries + 1} attempt(s): {last_error}") from last_error
 
 
 class LeRobotSource:
@@ -223,8 +246,9 @@ class LeRobotSource:
     name = "lerobot"
     unit = "episode"
 
-    def __init__(self, root: Path, datasets: Optional[Sequence[str]] = None) -> None:
+    def __init__(self, root: Path, datasets: Optional[Sequence[str]] = None, decode_retries: int = 0) -> None:
         self.root = root
+        self.decode_retries = decode_retries
         names = sorted(path.name for path in root.iterdir() if (path / "meta" / "info.json").is_file())
         if datasets is not None:
             missing = sorted(set(datasets) - set(names))
@@ -265,7 +289,13 @@ class LeRobotSource:
     def load(self, key: str) -> Tuple[np.ndarray, List[float]]:
         dataset, stem = key.split("/", 1)
         episode_index = int(stem[len("episode_") : -len(".npz")])
-        views = [decode_episode_video(self._video_path(dataset, episode_index, view)) for view in LEROBOT_VIEW_KEYS]
+        views = []
+        for view in LEROBOT_VIEW_KEYS:
+            path = self._video_path(dataset, episode_index, view)
+            try:
+                views.append(decode_episode_video(path, retries=self.decode_retries))
+            except EpisodeDecodeError as error:
+                raise EpisodeDecodeError(f"{key} {view}: {error}") from error
         expected = self._lengths[key]
         for view_key, frames in zip(LEROBOT_VIEW_KEYS, views):
             if frames.shape[0] != expected:
@@ -296,7 +326,7 @@ def build_source(args: argparse.Namespace) -> object:
     if args.source == "clips":
         return ClipCacheSource(args.clips)
     if args.source == "lerobot":
-        return LeRobotSource(args.lerobot_root, args.datasets)
+        return LeRobotSource(args.lerobot_root, args.datasets, args.decode_retries)
     raise SystemExit(f"unknown source {args.source!r}")
 
 
@@ -543,6 +573,18 @@ def pending_jobs(
         yield key, destination
 
 
+def read_decode_failures(path: Path) -> Dict[str, Dict[str, str]]:
+    """Latest failure provenance by cache key, preserving unresolved failures across resumes."""
+    if not path.exists():
+        return {}
+    failures = {}
+    for line in path.read_text().splitlines():
+        if line.strip():
+            record = json.loads(line)
+            failures[record["key"]] = record
+    return failures
+
+
 def run(args: argparse.Namespace) -> None:
     # `--stride` takes every n-th clip in manifest order, which spans all four suites instead of the
     # first suite `--limit` alone would give. Deterministic from the manifest, so two runs of the same
@@ -568,8 +610,24 @@ def run(args: argparse.Namespace) -> None:
     self_metric_seen = set(previous.get("model_reported_metric", []))
     converted_seen = set(previous.get("canonical_conversion_applied", []))
     written, started = 0, time.time()
+    failure_path = out / "decode_failures.jsonl"
+    failures = read_decode_failures(failure_path)
     for key, destination in pending_jobs(source, keys, out, args.overwrite, args.limit):
-        rgb, focals = source.load(key)  # [T, V, H, W, 3], one focal per view
+        try:
+            rgb, focals = source.load(key)  # [T, V, H, W, 3], one focal per view
+        except EpisodeDecodeError as error:
+            if not args.record_decode_failures:
+                raise
+            failure = {"key": key, "error": str(error), "written_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+            if key not in failures:
+                with failure_path.open("a") as handle:
+                    handle.write(json.dumps(failure, sort_keys=True) + "\n")
+            failures[key] = failure
+            print(f"WARNING: skipped undecodable {key}: {error}", flush=True)
+            continue
+        # A resumed run may repair a previously recorded decode failure.  Remove the stale
+        # provenance entry so `num_decode_failures` describes unresolved failures, not history.
+        failures.pop(key, None)
         num_frames, num_views, height, width = rgb.shape[:4]
 
         depths, confs = [], []
@@ -602,6 +660,10 @@ def run(args: argparse.Namespace) -> None:
     # `is_metric` / `has_conf` fall back to a unit already on disk and `complete` says which it is.
     written_keys = [key for key in all_keys if source.destination(key, out).exists()]
     present = len(written_keys)
+    # A prior failed run can leave a failure record after an external repair or a successful
+    # resume that skipped the already-present destination.  The destination is authoritative:
+    # retain only unresolved keys so the index and sidecar describe the same cache state.
+    failures = {key: record for key, record in failures.items() if not source.destination(key, out).exists()}
     if written:
         has_conf = "conf" in payload
     elif present:
@@ -609,6 +671,12 @@ def run(args: argparse.Namespace) -> None:
             has_conf = "conf" in clip.files
     else:
         has_conf = None
+
+    if args.record_decode_failures:
+        if failures:
+            failure_path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in failures.values()))
+        elif failure_path.exists():
+            failure_path.unlink()
 
     index = {
         "estimator": args.estimator,
@@ -629,6 +697,7 @@ def run(args: argparse.Namespace) -> None:
         "num_clips": len(all_keys),
         "num_written": written,
         "num_present": present,
+        "num_decode_failures": len(failures),
         "stride": args.stride,
         "offset": args.offset,
         "complete": present == len(all_keys),
@@ -677,6 +746,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=None,
         help="restrict the lerobot source to these dataset directories; default is all of them",
     )
+    parser.add_argument(
+        "--decode-retries",
+        type=int,
+        default=0,
+        help="retry each LeRobot AV1 decode this many times before surfacing its episode/view provenance",
+    )
+    parser.add_argument(
+        "--record-decode-failures",
+        action="store_true",
+        help="continue after exhausted LeRobot decode retries and append provenance to decode_failures.jsonl",
+    )
     parser.add_argument("--out", type=Path, default=Path("/vepfs/wangshilong/data/dynaweave/i3_pseudo_depth"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true", help="recompute clips that already have a file")
@@ -689,7 +769,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--offset", type=int, default=0, help="first clip index of the strided work list")
     parser.add_argument("--hf-revision", default=None, help="Hub commit the weights were downloaded at")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.decode_retries < 0:
+        parser.error("--decode-retries must be non-negative")
+    return args
 
 
 if __name__ == "__main__":

@@ -67,7 +67,7 @@ logger = get_logger(__name__)
 
 # Submodules whose gradient norm is reported on logging steps. The V-JEPA teacher is deliberately
 # absent: it is frozen, and _gradient_metrics checks that it stays that way instead of logging it.
-GRAD_NORM_MODULES = ("qwen_vl_interface", "action_model", "vj_predictor")
+GRAD_NORM_MODULES = ("qwen_vl_interface", "action_model", "vj_predictor", "depth_delta_head")
 
 
 def load_fast_tokenizer():
@@ -173,6 +173,8 @@ class VLATrainer(TrainerUtils):
                 self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
             )
             self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+        if self.config.framework.vj2_model.get("reinit_predictor", False):
+            self.model.reinitialize_world_predictor()
 
         # freeze parameters
         freeze_modules = (

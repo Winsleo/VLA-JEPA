@@ -40,6 +40,8 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = "libero_goal"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+    task_id: int | None = None  # Optional isolated task process for EGL-safe parallel evaluation.
+    episode_id: int | None = None  # Optional isolated episode process for native renderer failures.
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
     category_value: str = "Background Textures"
@@ -80,6 +82,17 @@ def eval_libero(args: Args) -> None:
     else:
         task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
+    if args.task_id is not None and not 0 <= args.task_id < num_tasks_in_suite:
+        raise ValueError(
+            f"task_id must be in [0, {num_tasks_in_suite}), got {args.task_id}"
+        )
+    if args.episode_id is not None:
+        if args.task_id is None:
+            raise ValueError("episode_id requires task_id so the episode has a stable task context")
+        if not 0 <= args.episode_id < args.num_trials_per_task:
+            raise ValueError(
+                f"episode_id must be in [0, {args.num_trials_per_task}), got {args.episode_id}"
+            )
     logging.info(f"Task suite: {args.task_suite_name}")
 
     # args.video_out_path = f"{date_base}+{args.job_name}"
@@ -109,7 +122,8 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    task_ids = range(num_tasks_in_suite) if args.task_id is None else [args.task_id]
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -121,7 +135,12 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+        episode_ids = (
+            range(args.num_trials_per_task)
+            if args.episode_id is None
+            else [args.episode_id]
+        )
+        for episode_idx in tqdm.tqdm(episode_ids):
             logging.info(f"\nTask: {task_description}")
 
             # Reset environment
@@ -258,6 +277,11 @@ def eval_libero(args: Args) -> None:
         logging.info(
             f"Current total success rate: {float(total_successes) / float(total_episodes)}"
         )
+
+        # LIBERO creates a fresh MuJoCo / EGL context for every task.  Release the
+        # previous task before constructing the next one; otherwise the pinned
+        # robosuite renderer can abort inside ``mjr_readPixels`` on the next task.
+        env.close()
 
     logging.info(
         f"Total success rate: {float(total_successes) / float(total_episodes)}"

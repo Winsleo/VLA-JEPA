@@ -102,6 +102,9 @@ def get_vla_dataset(
         with_state=data_cfg.get("with_state", False),
         resolution_size=data_cfg.get("resolution_size", 224),
         video_resolution_size=data_cfg.get("video_resolution_size", 256),
+        depth_cache_root=data_cfg.get("depth_cache_root"),
+        depth_state_cache_root=data_cfg.get("depth_state_cache_root"),
+        depth_cache_estimator=data_cfg.get("depth_cache_estimator", "DA3METRIC-LARGE"),
         seed=seed,
         **kwargs,
     )

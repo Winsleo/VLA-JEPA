@@ -47,7 +47,12 @@ framework:
       output_dim: 1024
       positional_embeddings: null
   vj2_model:
+    # Explicit I2 defaults. I4 can select vjepa21 with teacher_weights while this path remains
+    # compatible with the published V-JEPA 2 checkpoint.
+    teacher: vjepa2
     base_encoder: /vepfs/wangshilong/models/dynaweave/vjepa2-vitl-fpc64-256
+    input_size: 256
+    reinit_predictor: false
     depth: 12
     num_heads: 8
     special_action_token: <|action_{}|>
@@ -58,6 +63,15 @@ framework:
     # Upstream pairs clips with the wrong views when batch > 1; false keeps that behaviour so the
     # I2 parity goldens stay bitwise. Turn on for I4, where wm_loss is the studied signal.
     correct_view_fusion: false
+  depth_head:
+    # I4 is opt-in; leaving this disabled preserves the I2/I3 training path exactly.
+    enabled: false
+    channels: 64
+    weight: 0.05
+    gradient_weight: 0.5
+    target_grid: [16, 16]
+    tubelet_size: 2
+    delta_lag: 1
   reduce_in_full_precision: true
 datasets:
   vla_data:
@@ -72,6 +86,9 @@ datasets:
     video_resolution_size: 256
     load_all_data_for_training: true
     with_state: true
+    depth_cache_root: null
+    depth_state_cache_root: null
+    depth_cache_estimator: DA3METRIC-LARGE
 trainer:
   epochs: 100
   max_train_steps: 30000

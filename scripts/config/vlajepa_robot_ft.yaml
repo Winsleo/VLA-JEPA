@@ -38,7 +38,10 @@ framework:
       output_dim: 1024
       positional_embeddings: null
   vj2_model:
+    teacher: vjepa2
     base_encoder: /vepfs/wangshilong/models/dynaweave/vjepa2-vitl-fpc64-256
+    input_size: 256
+    reinit_predictor: false
     depth: 12
     num_heads: 8
     special_action_token: <|action_{}|>

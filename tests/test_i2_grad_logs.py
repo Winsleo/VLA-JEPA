@@ -7,6 +7,8 @@ a toy module instead of the 2.8B framework; the trainer only orchestrates them.
 Pure logic, CPU-only.
 """
 
+import ast
+
 import pytest
 import torch
 import torch.nn as nn
@@ -154,6 +156,21 @@ def test_gradient_diagnostics_run_before_the_optimizer_consumes_the_gradients():
 
 
 def test_the_frozen_teacher_is_checked_rather_than_logged():
+    """The teacher must never appear in the grad-norm list; a trainable module legitimately may.
+
+    Asserted as membership rather than as the literal tuple. The literal form broke the moment I4
+    added `depth_delta_head`, which is exactly the kind of change this test should allow, while the
+    thing it must forbid -- logging a norm for the frozen encoder instead of asserting it has none --
+    was only pinned by accident.
+    """
     source = _train_starvla_source()
-    assert 'GRAD_NORM_MODULES = ("qwen_vl_interface", "action_model", "vj_predictor")' in source
+    assignment = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.Assign)
+        and any(getattr(target, "id", None) == "GRAD_NORM_MODULES" for target in node.targets)
+    )
+    modules = set(ast.literal_eval(assignment.value))
+    assert "vj_encoder" not in modules, "the frozen teacher must be checked, not logged"
+    assert {"qwen_vl_interface", "action_model", "vj_predictor"}.issubset(modules)
     assert "frozen_module_has_no_gradient(teacher)" in source

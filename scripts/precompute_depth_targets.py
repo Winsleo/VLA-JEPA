@@ -194,44 +194,132 @@ class EpisodeDecodeError(RuntimeError):
     """A recoverable decode failure with the episode/view provenance needed for a retry."""
 
 
-def decode_episode_video(path: str, retries: int = 0) -> np.ndarray:
-    """One episode's frames as `[T, H, W, 3]` uint8, decoded the way the trainer decodes them.
+def _release_reader(reader: object) -> None:
+    """Drop a torchvision pyav reader's native handles at the call boundary.
 
-    `starVLA/dataloader/lerobot_datasets.py` pins `video_backend="torchvision_av"`, so the frames the
-    model sees come from `torchvision.io.VideoReader` on the pyav backend. This reads the same reader
-    straight through instead of re-seeking per timestamp: measured over 4 suites x 3 episodes x 2
-    views, a sequential pass is **byte-identical** to the trainer's per-timestamp seek and yields
-    exactly `episodes.jsonl`'s `length` frames, so frame `i` here is frame `i` there. That equality is
-    what makes an absolute frame index a valid cache key; `tests/test_i4_depth_alignment.py` keeps it
-    honest. Decord is *not* used -- neither environment's build can open these AV1 streams.
+    The reader otherwise keeps its C++ decoder alive until GC. This script opens two streams per
+    episode for thousands of episodes, so native handles would accumulate.
+    """
+    if hasattr(reader, "_c"):
+        reader._c = None
+    container = getattr(reader, "container", None)
+    if container is not None:
+        container.close()
+
+
+def _decode_sequentially(path: str) -> np.ndarray:
+    """Every frame in one straight pass, `[T, H, W, 3]` uint8."""
+    import torchvision
+
+    torchvision.set_video_backend("pyav")
+    reader = torchvision.io.VideoReader(path, "video")
+    try:
+        frames = [frame["data"].cpu().numpy() for frame in reader]
+    finally:
+        _release_reader(reader)
+    if not frames:
+        raise EpisodeDecodeError(f"decoded no frames from {path}")
+    return np.stack(frames).transpose(0, 2, 3, 1)  # [T, C, H, W] -> [T, H, W, 3]
+
+
+def _decode_frame_by_trainer_seek(path: str, target_ts: float, tolerance: float) -> Optional[np.ndarray]:
+    """One frame via the trainer's own seek algorithm, or `None` if the stream cannot yield it.
+
+    This mirrors the `torchvision_av` branch of `gr00t_lerobot/video.get_frames_by_timestamps`
+    exactly: seek to the preceding keyframe, scan forward, and keep the frame whose pts is closest to
+    the target, stopping as soon as the difference starts growing. A fresh reader per timestamp is
+    used deliberately -- once a corrupt packet poisons a decoder, a shared reader cannot be trusted
+    for subsequent seeks. `tolerance` rejects a frame that is merely the closest survivor rather than
+    the requested one, so a substitution is never mistaken for a real decode.
     """
     import torchvision
 
     torchvision.set_video_backend("pyav")
+    reader = torchvision.io.VideoReader(path, "video")
+    try:
+        reader.seek(target_ts, keyframes_only=True)
+        closest, closest_diff = None, float("inf")
+        for frame in reader:
+            diff = abs(frame["pts"] - target_ts)
+            if closest is None:
+                closest = frame
+            if diff < closest_diff:
+                closest_diff, closest = diff, frame
+            else:
+                break
+        if closest is None or closest_diff > tolerance:
+            return None
+        return closest["data"].cpu().numpy().transpose(1, 2, 0)  # [C, H, W] -> [H, W, 3]
+    except Exception:
+        return None
+    finally:
+        _release_reader(reader)
+
+
+def decode_episode_video(
+    path: str,
+    retries: int = 0,
+    expected_frames: Optional[int] = None,
+    fps: Optional[float] = None,
+) -> Tuple[np.ndarray, List[int]]:
+    """One episode's frames as `[T, H, W, 3]` uint8 plus the indices this call had to substitute.
+
+    `starVLA/dataloader/lerobot_datasets.py` pins `video_backend="torchvision_av"`, so the frames the
+    model sees come from `torchvision.io.VideoReader` on the pyav backend. The fast path reads the
+    same reader straight through instead of re-seeking per timestamp: measured over 4 suites x 3
+    episodes x 2 views, a sequential pass is **byte-identical** to the trainer's per-timestamp seek
+    and yields exactly `episodes.jsonl`'s `length` frames, so frame `i` here is frame `i` there. That
+    equality is what makes an absolute frame index a valid cache key;
+    `tests/test_i4_depth_alignment.py` keeps it honest. Decord is *not* used -- neither environment's
+    build can open these AV1 streams.
+
+    A sequential pass is however strictly more fragile than the trainer's read: one corrupt packet
+    ends it, while the trainer only loses the timestamps whose keyframe-to-target scan crosses that
+    packet. `libero_goal/episode_000082`'s wrist view is such a file upstream -- the copy in TOS is
+    byte-identical, so this is the published data, not a restore artifact. When `expected_frames` and
+    `fps` are supplied, a failed sequential pass therefore falls back to decoding each index through
+    the trainer's own seek algorithm, which is the definition of alignment that matters here: cache
+    frame `i` is whatever RGB frame `i` the trainer would receive.
+
+    Indices that neither path can decode are filled by carrying the previous decoded frame forward
+    and are returned to the caller for provenance. They are *not* recoverable data: the trainer
+    raises on exactly those timestamps, and `LeRobotMixtureDataset.__getitem__` catches that and
+    resamples, so any window covering such an index never reaches the model -- and the RGB fetch that
+    fails sits ahead of the depth lookup, so the substituted depth is never consumed either. The
+    carried-forward value keeps the array finite and keeps absolute frame indexing valid; it must
+    never be read as a measurement.
+    """
     last_error = None
     for attempt in range(retries + 1):
         try:
-            reader = torchvision.io.VideoReader(path, "video")
-            frames = []
-            try:
-                frames = [frame["data"].cpu().numpy() for frame in reader]
-            finally:
-                # torchvision's pyav reader otherwise keeps its C++ decoder alive until GC. This
-                # script opens two streams per episode for thousands of episodes, so release it at
-                # the episode boundary rather than allowing native handles to accumulate.
-                if hasattr(reader, "_c"):
-                    reader._c = None
-                container = getattr(reader, "container", None)
-                if container is not None:
-                    container.close()
-            if not frames:
-                raise EpisodeDecodeError(f"decoded no frames from {path}")
-            return np.stack(frames).transpose(0, 2, 3, 1)  # [T, C, H, W] -> [T, H, W, 3]
+            return _decode_sequentially(path), []
         except Exception as error:
             last_error = error
             if attempt < retries:
                 time.sleep(0.25 * (attempt + 1))
-    raise EpisodeDecodeError(f"failed to decode {path} after {retries + 1} attempt(s): {last_error}") from last_error
+
+    if expected_frames is None or fps is None or fps <= 0:
+        raise EpisodeDecodeError(
+            f"failed to decode {path} after {retries + 1} attempt(s): {last_error}"
+        ) from last_error
+
+    tolerance = 0.5 / fps
+    frames: List[np.ndarray] = []
+    substituted: List[int] = []
+    for index in range(expected_frames):
+        frame = _decode_frame_by_trainer_seek(path, index / fps, tolerance)
+        if frame is None:
+            if not frames:
+                # Nothing decoded yet, so there is no earlier frame to carry forward and the whole
+                # stream is suspect. Surface it rather than inventing a first frame.
+                raise EpisodeDecodeError(
+                    f"failed to decode {path} sequentially and could not seek frame {index}: {last_error}"
+                ) from last_error
+            frames.append(frames[-1])
+            substituted.append(index)
+            continue
+        frames.append(frame)
+    return np.stack(frames), substituted
 
 
 class LeRobotSource:
@@ -245,10 +333,14 @@ class LeRobotSource:
 
     name = "lerobot"
     unit = "episode"
+    view_keys = LEROBOT_VIEW_KEYS
 
     def __init__(self, root: Path, datasets: Optional[Sequence[str]] = None, decode_retries: int = 0) -> None:
         self.root = root
         self.decode_retries = decode_retries
+        # Per-episode record of frames no decoder path could produce, keyed `key -> view -> indices`.
+        # Populated by `load`; the caller writes it to the cache's provenance sidecar.
+        self.substitutions: Dict[str, Dict[str, List[int]]] = {}
         names = sorted(path.name for path in root.iterdir() if (path / "meta" / "info.json").is_file())
         if datasets is not None:
             missing = sorted(set(datasets) - set(names))
@@ -289,14 +381,24 @@ class LeRobotSource:
     def load(self, key: str) -> Tuple[np.ndarray, List[float]]:
         dataset, stem = key.split("/", 1)
         episode_index = int(stem[len("episode_") : -len(".npz")])
+        expected = self._lengths[key]
+        fps = float(self._info[dataset]["fps"])
         views = []
+        substituted: Dict[str, List[int]] = {}
         for view in LEROBOT_VIEW_KEYS:
             path = self._video_path(dataset, episode_index, view)
             try:
-                views.append(decode_episode_video(path, retries=self.decode_retries))
+                frames, indices = decode_episode_video(
+                    path, retries=self.decode_retries, expected_frames=expected, fps=fps
+                )
             except EpisodeDecodeError as error:
                 raise EpisodeDecodeError(f"{key} {view}: {error}") from error
-        expected = self._lengths[key]
+            views.append(frames)
+            if indices:
+                substituted[view] = indices
+        self.substitutions.pop(key, None)
+        if substituted:
+            self.substitutions[key] = substituted
         for view_key, frames in zip(LEROBOT_VIEW_KEYS, views):
             if frames.shape[0] != expected:
                 raise SystemExit(
@@ -311,7 +413,12 @@ class LeRobotSource:
             "lerobot_root": str(self.root),
             "datasets": self.datasets,
             "view_keys": list(LEROBOT_VIEW_KEYS),
-            "video_backend": "torchvision.io.VideoReader (pyav), read sequentially",
+            "video_backend": (
+                "torchvision.io.VideoReader (pyav), read sequentially; an episode whose sequential"
+                " pass hits a corrupt packet falls back to the trainer's own per-timestamp"
+                " keyframe seek, and any index neither path can decode is carried forward and"
+                " recorded in decode_substitutions.jsonl"
+            ),
             "focals": dict(LEROBOT_FOCALS),
             "focal_width": LEROBOT_FOCAL_WIDTH,
             "focal_provenance": (
@@ -585,6 +692,23 @@ def read_decode_failures(path: Path) -> Dict[str, Dict[str, str]]:
     return failures
 
 
+def read_substitutions(path: Path) -> Dict[str, Dict[str, object]]:
+    """Substituted-frame provenance by cache key.
+
+    Unlike `decode_failures.jsonl` this sidecar is never rebuilt from the run's own decodes: a
+    resumed or index-only run decodes nothing and would otherwise erase the record of a cache it did
+    not rewrite. Entries are dropped only when their episode leaves the cache.
+    """
+    if not path.exists():
+        return {}
+    records = {}
+    for line in path.read_text().splitlines():
+        if line.strip():
+            record = json.loads(line)
+            records[record["key"]] = record
+    return records
+
+
 def run(args: argparse.Namespace) -> None:
     # `--stride` takes every n-th clip in manifest order, which spans all four suites instead of the
     # first suite `--limit` alone would give. Deterministic from the manifest, so two runs of the same
@@ -612,6 +736,8 @@ def run(args: argparse.Namespace) -> None:
     written, started = 0, time.time()
     failure_path = out / "decode_failures.jsonl"
     failures = read_decode_failures(failure_path)
+    substitution_path = out / "decode_substitutions.jsonl"
+    substitutions = read_substitutions(substitution_path)
     for key, destination in pending_jobs(source, keys, out, args.overwrite, args.limit):
         try:
             rgb, focals = source.load(key)  # [T, V, H, W, 3], one focal per view
@@ -630,6 +756,28 @@ def run(args: argparse.Namespace) -> None:
         failures.pop(key, None)
         num_frames, num_views, height, width = rgb.shape[:4]
 
+        # Frames no decoder path could produce, carried forward from the previous frame. Recorded as
+        # a `[T, V]` mask beside `depth_m` so a consumer can find them without the sidecar, and in
+        # the sidecar so the index can count them without opening every episode.
+        episode_substitutions = getattr(source, "substitutions", {}).get(key, {})
+        substituted_mask = np.zeros((num_frames, num_views), dtype=bool)
+        for view_index, view_key in enumerate(getattr(source, "view_keys", ())):
+            for frame_index in episode_substitutions.get(view_key, ()):
+                substituted_mask[frame_index, view_index] = True
+        if episode_substitutions:
+            record = {
+                "key": key,
+                "substituted": {view: list(indices) for view, indices in episode_substitutions.items()},
+                "num_substituted": int(substituted_mask.sum()),
+                "written_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            with substitution_path.open("a") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            substitutions[key] = record
+            print(f"WARNING: {key} carried forward {record['num_substituted']} undecodable frame(s)", flush=True)
+        else:
+            substitutions.pop(key, None)
+
         depths, confs = [], []
         for view in range(num_views):
             depth, conf, self_metric = backend(rgb[:, view], focal_recorded=focals[view], recorded_width=width)
@@ -641,6 +789,8 @@ def run(args: argparse.Namespace) -> None:
         # Back to the cache's `[T, V, H, W]` layout so the pseudo cache is a drop-in for `depth_m`.
         stacked = np.stack(depths, axis=1).astype(DEPTH_DTYPE)
         payload = {"depth_m": stacked}
+        if substituted_mask.any():
+            payload["substituted_frames"] = substituted_mask
         if all(conf is not None for conf in confs):
             payload["conf"] = np.stack(confs, axis=1).astype(DEPTH_DTYPE)
 
@@ -664,6 +814,12 @@ def run(args: argparse.Namespace) -> None:
     # resume that skipped the already-present destination.  The destination is authoritative:
     # retain only unresolved keys so the index and sidecar describe the same cache state.
     failures = {key: record for key, record in failures.items() if not source.destination(key, out).exists()}
+    # Re-read before pruning: sharded workers append to one sidecar, so a worker that started early
+    # holds a stale view and would otherwise drop a sibling's record when it rewrites the file.
+    # Mirror image of the failure rule: a substitution describes an episode that *is* in the cache,
+    # so drop the record only when its episode is gone.
+    substitutions = {**read_substitutions(substitution_path), **substitutions}
+    substitutions = {key: record for key, record in substitutions.items() if source.destination(key, out).exists()}
     if written:
         has_conf = "conf" in payload
     elif present:
@@ -677,6 +833,15 @@ def run(args: argparse.Namespace) -> None:
             failure_path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in failures.values()))
         elif failure_path.exists():
             failure_path.unlink()
+
+    # Unconditional, unlike the failure sidecar: substitutions are a property of the cache on disk,
+    # not an opt-in diagnostic, and every shard appends to the same file.
+    if substitutions:
+        substitution_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in substitutions.values())
+        )
+    elif substitution_path.exists():
+        substitution_path.unlink()
 
     index = {
         "estimator": args.estimator,
@@ -698,6 +863,14 @@ def run(args: argparse.Namespace) -> None:
         "num_written": written,
         "num_present": present,
         "num_decode_failures": len(failures),
+        "num_substituted_episodes": len(substitutions),
+        "num_substituted_frames": sum(int(record["num_substituted"]) for record in substitutions.values()),
+        "substituted_frames": (
+            "frames no decoder path could produce, carried forward from the previous frame and"
+            " flagged in each episode's `substituted_frames` [T, V] mask and in"
+            " decode_substitutions.jsonl. They are not measurements: the trainer raises on exactly"
+            " those timestamps and resamples, so no window covering one reaches the model."
+        ),
         "stride": args.stride,
         "offset": args.offset,
         "complete": present == len(all_keys),

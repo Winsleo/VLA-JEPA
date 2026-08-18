@@ -260,17 +260,15 @@ def run_fit(args: argparse.Namespace) -> None:
 
         reference = float(masked_l1(constant.expand_as(data["test"].deltas), data["test"].deltas, data["test"].deltas_mask))
 
-        scores = []
-        for seed in args.seeds:
-            best = token_probe.fit(
-                data["train"], data["val"], tokens=tokens, hidden=hidden, num_views=deltas.shape[2],
-                grid=tuple(args.grid), seed=seed, device=args.device,
-            )
-            head = token_probe.TokenReadout(tokens, hidden, deltas.shape[2], tuple(args.grid)).to(args.device)
-            head.load_state_dict(best["state_dict"])
-            test = token_probe.evaluate(head, data["test"])
-            scores.append(test)
-            print(f"  {name} seed{seed}: val {best['val']:.5f} test {test:.5f} (lr {best['lr']}, epoch {best['epoch']})")
+        best = token_probe.fit_ridge(
+            data["train"], data["val"], tokens=tokens, hidden=hidden,
+            num_views=deltas.shape[2], grid=tuple(args.grid), device=args.device,
+        )
+        head = token_probe.TokenReadout(tokens, hidden, deltas.shape[2], tuple(args.grid)).to(args.device)
+        head.load_state_dict(best["state_dict"])
+        scores = [token_probe.evaluate(head, data["test"])]
+        print(f"  {name}: val {best['val']:.5f} test {scores[0]:.5f} (penalty {best['penalty']:g}) "
+              f"vs feature-free {reference:.5f}")
         report["arms"][name] = {
             "test_masked_l1": scores,
             "mean": statistics.mean(scores),
@@ -290,7 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid", type=int, nargs=2, default=[16, 16])
     parser.add_argument("--tubelet-size", type=int, default=2)
     parser.add_argument("--delta-lag", type=int, default=1)
-    parser.add_argument("--target-type", default="pseudo_metric")
+    parser.add_argument(
+        "--target-type",
+        default="sim_metric",
+        help="the recorded clips carry simulator ground truth; the pseudo estimator is a separate cache",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda")

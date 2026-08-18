@@ -34,6 +34,17 @@ class TokenReadout(nn.Module):
 
     The map is shared across transitions, so the probe cannot memorise a per-transition constant
     that a feature-free baseline would also reach.
+
+    Two deliberate departures from a stock linear head, both so that the number being reported is a
+    property of the representation rather than of the optimiser's luck:
+
+    - The weight starts at zero and the bias at the feature-free constant, so the probe *begins*
+      exactly at the reference it is scored against and can only move away from it by using the
+      features. Measured on real action tokens, a default `nn.Linear` over a 16384-wide fan-in emits
+      values around 35 while the targets have a standard deviation of 0.077; a fixed epoch budget
+      then mostly measures how far each arm crawled back from its initialisation.
+    - Features are standardised by statistics fitted on the training split alone. A linear map could
+      absorb the scale in principle, so this changes conditioning rather than expressivity.
     """
 
     def __init__(self, tokens: int, hidden: int, num_views: int, grid: Tuple[int, int]) -> None:
@@ -41,10 +52,27 @@ class TokenReadout(nn.Module):
         self.tokens, self.hidden, self.num_views, self.grid = tokens, hidden, num_views, grid
         height, width = grid
         self.linear = nn.Linear(tokens * hidden, num_views * height * width)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+        self.register_buffer("feature_mean", torch.zeros(tokens * hidden))
+        self.register_buffer("feature_scale", torch.ones(tokens * hidden))
+
+    def set_normalizer(self, mean: torch.Tensor, scale: torch.Tensor) -> None:
+        """Adopt training-split feature statistics; `scale` is clamped so a dead channel is a no-op."""
+        self.feature_mean.copy_(mean.reshape(-1))
+        self.feature_scale.copy_(scale.reshape(-1).clamp_min(1e-6))
+
+    def set_constant(self, constant: torch.Tensor) -> None:
+        """Start the probe at the feature-free per-cell mean, averaged over transitions.
+
+        The readout is shared across transitions, so the one bias it owns is the transition mean.
+        """
+        self.linear.bias.data.copy_(constant.mean(dim=0).reshape(-1))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         rows, transitions = features.shape[:2]
         flat = features.reshape(rows, transitions, self.tokens * self.hidden)
+        flat = (flat - self.feature_mean) / self.feature_scale
         height, width = self.grid
         out = self.linear(flat)  # [N, T, V * h * w]
         return out.reshape(rows, transitions, self.num_views, 1, height, width)
@@ -103,6 +131,56 @@ def evaluate(head: nn.Module, data: TokenProbeInputs, batch_rows: int = 64) -> f
     return float(masked_l1(predict(head, data, batch_rows), data.deltas, data.deltas_mask))
 
 
+def fit_ridge(
+    train: TokenProbeInputs,
+    val: TokenProbeInputs,
+    *,
+    tokens: int,
+    hidden: int,
+    num_views: int,
+    grid: Tuple[int, int],
+    penalties: Sequence[float] = (1e2, 1e3, 1e4, 1e5, 1e6, 1e7),
+    device: str = "cuda",
+) -> Dict[str, object]:
+    """Closed-form ridge readout, penalty selected on val, never on test.
+
+    Ridge rather than SGD because this probe is badly overdetermined: 8.4M weights against 2880
+    training rows. Measured on real action tokens, an unregularised SGD fit selected on val still
+    landed six times *worse* than the feature-free constant, which says the fit overfits from the
+    first step rather than that the tokens carry no geometry.
+
+    Solved in the dual, `W = X^T (X X^T + lambda I)^-1 Y`, because `n << p`: that inverts a
+    2880x2880 matrix instead of a 16384x16384 one. The largest penalty in the grid drives the weight
+    to zero, so the selected probe can never be worse than the constant it starts at.
+    """
+    flat_train = train.features.reshape(-1, tokens * hidden).to(device=device, dtype=torch.float32)
+    mean, scale = flat_train.mean(dim=0), flat_train.std(dim=0).clamp_min(1e-6)
+    constant = constant_baseline(train).to(device)
+    centre = constant.mean(dim=0).reshape(-1)
+
+    features = (flat_train - mean) / scale
+    targets = train.deltas.reshape(features.shape[0], -1).to(device=device, dtype=torch.float32) - centre
+    gram = features @ features.T
+    eye = torch.eye(gram.shape[0], device=device, dtype=gram.dtype)
+
+    best: Dict[str, object] = {"val": float("inf")}
+    for penalty in penalties:
+        dual = torch.linalg.solve(gram + penalty * eye, targets)
+        weight = (features.T @ dual).T  # [out, p]
+        head = TokenReadout(tokens, hidden, num_views, grid).to(device)
+        head.set_normalizer(mean, scale)
+        head.set_constant(constant)
+        head.linear.weight.data.copy_(weight)
+        score = evaluate(head, val)
+        if score < best["val"]:
+            best = {
+                "val": score,
+                "penalty": penalty,
+                "state_dict": {k: v.detach().cpu().clone() for k, v in head.state_dict().items()},
+            }
+    return best
+
+
 def fit(
     train: TokenProbeInputs,
     val: TokenProbeInputs,
@@ -119,13 +197,22 @@ def fit(
 ) -> Dict[str, object]:
     """Fit one probe under a fixed budget and select `(lr, epoch)` on val, never on test.
 
+    Kept as the SGD reference next to `fit_ridge`, which is what the report uses: at 8.4M weights
+    against 2880 rows this path overfits from the first step.
+
     Every arm is fitted under the identical grid so the comparison is of representations, not of
     tuning effort. Returns the selected point and the fitted head's state dict.
     """
+    flat = train.features.reshape(-1, tokens * hidden).to(torch.float32)
+    mean, scale = flat.mean(dim=0), flat.std(dim=0)
+    constant = constant_baseline(train)
+
     best: Dict[str, object] = {"val": float("inf")}
     for lr in lr_grid:
         torch.manual_seed(seed)
         head = TokenReadout(tokens, hidden, num_views, grid).to(device)
+        head.set_normalizer(mean.to(device), scale.to(device))
+        head.set_constant(constant.to(device))
         optimiser = torch.optim.Adam(head.parameters(), lr=lr)
         for epoch in range(1, max(epochs) + 1):
             generator = torch.Generator(device="cpu").manual_seed(seed * 1000 + epoch)

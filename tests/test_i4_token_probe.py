@@ -126,3 +126,41 @@ def test_predict_is_batch_size_invariant():
     data = _inputs(10)
     head = TokenReadout(TOKENS, HIDDEN, VIEWS, GRID)
     assert torch.allclose(predict(head, data, batch_rows=3), predict(head, data, batch_rows=10), atol=1e-6)
+def test_probe_starts_at_the_feature_free_reference():
+    """A zero weight plus the constant bias means the probe begins exactly at the baseline.
+
+    Without this the reported improvement would partly measure how far each arm's optimiser crawled
+    back from a badly scaled initialisation, which differs between arms for reasons unrelated to
+    geometry.
+    """
+    import torch
+
+    from starVLA.probes.geo_probe import masked_l1
+    from starVLA.probes.token_probe import TokenProbeInputs, TokenReadout, constant_baseline
+
+    generator = torch.Generator().manual_seed(5)
+    features = torch.randn(16, 3, TOKENS, HIDDEN, generator=generator) * 30.0
+    deltas = torch.randn(16, 3, VIEWS, 1, *GRID, generator=generator) * 0.08
+    data = TokenProbeInputs(features=features, deltas=deltas, deltas_mask=torch.ones_like(deltas, dtype=torch.bool))
+
+    head = TokenReadout(TOKENS, HIDDEN, VIEWS, GRID)
+    flat = data.features.reshape(-1, TOKENS * HIDDEN)
+    head.set_normalizer(flat.mean(dim=0), flat.std(dim=0))
+    constant = constant_baseline(data)
+    head.set_constant(constant)
+
+    started = float(masked_l1(head(data.features), data.deltas, data.deltas_mask))
+    reference = float(masked_l1(constant.mean(dim=0).expand_as(data.deltas), data.deltas, data.deltas_mask))
+    assert abs(started - reference) < 1e-5, f"probe started at {started}, reference is {reference}"
+
+
+def test_normalizer_survives_a_dead_channel():
+    """A constant feature channel has zero variance; dividing by it must not produce NaN."""
+    import torch
+
+    from starVLA.probes.token_probe import TokenReadout
+
+    head = TokenReadout(TOKENS, HIDDEN, VIEWS, GRID)
+    head.set_normalizer(torch.zeros(TOKENS * HIDDEN), torch.zeros(TOKENS * HIDDEN))
+    out = head(torch.randn(2, 3, TOKENS, HIDDEN))
+    assert torch.isfinite(out).all()

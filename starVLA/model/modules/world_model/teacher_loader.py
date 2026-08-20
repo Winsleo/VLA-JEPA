@@ -15,7 +15,7 @@ The two teachers need different loaders, which is the whole reason this exists:
              constructed here, because the checkpoint ships none.
 
 Lives under `world_model/` rather than `probes/` because both the I3 probe bench
-(`starVLA/probes/arms.py`) and the I4 training framework (`model/framework/VLA_JEPA.py`) need it.
+(`starVLA/probes/arms.py`) and the I4 training framework (`model/framework/VLM4A/VLA_JEPA.py`) need it.
 The dependency runs probes -> world_model and framework -> world_model; `world_model` imports
 neither, which is what keeps `tests/test_i3_probe_firewall.py` meaningful.
 """

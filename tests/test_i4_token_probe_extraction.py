@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run_i4_token_probe.py"
-FRAMEWORK = Path(__file__).resolve().parents[1] / "starVLA" / "model" / "framework" / "VLA_JEPA.py"
+FRAMEWORK = Path(__file__).resolve().parents[1] / "starVLA" / "model" / "framework" / "VLM4A" / "VLA_JEPA.py"
 
 
 def _module():

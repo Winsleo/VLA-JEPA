@@ -153,7 +153,7 @@ def load_config():
 
 def build_probe_model(cfg):
     """Model with the published LIBERO weights, i.e. a fixed starting point for every probe."""
-    from starVLA.model.framework.VLA_JEPA import VLA_JEPA
+    from starVLA.model.framework.VLM4A.VLA_JEPA import VLA_JEPA
 
     torch.manual_seed(SEED)
     model = VLA_JEPA(cfg).to("cuda")

@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from omegaconf import OmegaConf
 
-from starVLA.model.framework.VLA_JEPA import reinitialize_predictor
+from starVLA.model.framework.VLM4A.VLA_JEPA import reinitialize_predictor
 from starVLA.model.modules.world_model.vj2_predictor import VisionTransformerPredictorAC
 
 
@@ -48,7 +48,7 @@ def test_i2_config_keeps_the_pinned_teacher_and_does_not_reinitialize():
 
 def test_framework_uses_the_shared_loader_and_resets_after_super_load():
     """Static ordering keeps default I2 behavior while making I4 reset checkpoint-derived state."""
-    source = Path(__file__).parents[1] / "starVLA" / "model" / "framework" / "VLA_JEPA.py"
+    source = Path(__file__).parents[1] / "starVLA" / "model" / "framework" / "VLM4A" / "VLA_JEPA.py"
     tree = ast.parse(source.read_text())
     method = next(
         node

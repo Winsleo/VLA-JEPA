@@ -50,7 +50,7 @@ def cfg():
 @pytest.fixture(scope="module")
 def model(cfg):
     _require_gpu_and_weights(cfg)
-    from starVLA.model.framework.VLA_JEPA import VLA_JEPA
+    from starVLA.model.framework.VLM4A.VLA_JEPA import VLA_JEPA
 
     torch.manual_seed(SEED)
     model = VLA_JEPA(cfg).to("cuda")

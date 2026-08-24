@@ -24,11 +24,18 @@ try:
 except NameError:
     pkg_path = None
 
-# Auto-import all framework submodules to trigger registration
+# Auto-import all framework submodules to trigger registration. Top-level modules are scanned as
+# before; a top-level entry that is itself a package (e.g. VLM4A/) is scanned one level deeper so
+# frameworks nested under it still register (I4.5 upstream realignment: structure-only change, the
+# registry lookup semantics below are unchanged).
 if pkg_path is not None:
     try:
-        for _, module_name, _ in pkgutil.iter_modules(pkg_path):
+        for _, module_name, is_pkg in pkgutil.iter_modules(pkg_path):
             importlib.import_module(f"{__name__}.{module_name}")
+            if is_pkg:
+                sub_module = importlib.import_module(f"{__name__}.{module_name}")
+                for _, sub_name, _ in pkgutil.iter_modules(sub_module.__path__):
+                    importlib.import_module(f"{__name__}.{module_name}.{sub_name}")
     except Exception as e:
         logger.log(f"Warning: Failed to auto-import framework submodules: {e}")
         
@@ -46,10 +53,10 @@ def build_framework(cfg):
         cfg.framework.name = cfg.framework.framework_py  # Backward compatibility for legacy config yaml
         
     if cfg.framework.name == "QwenOFT":
-        from starVLA.model.framework.QwenOFT import Qwenvl_OFT
+        from starVLA.model.framework.VLM4A.QwenOFT import Qwenvl_OFT
         return Qwenvl_OFT(cfg)
     elif cfg.framework.name == "QwenFast":
-        from starVLA.model.framework.QwenFast import Qwenvl_Fast
+        from starVLA.model.framework.VLM4A.QwenFast import Qwenvl_Fast
         return Qwenvl_Fast(cfg)
 
     # auto detect from registry

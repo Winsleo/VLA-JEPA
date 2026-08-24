@@ -286,5 +286,5 @@ def test_repeated_diffusion_steps_effective_value_is_pinned(cfg):
     effective = cfg.trainer.get("repeated_diffusion_steps", EFFECTIVE_REPEATED_DIFFUSION_STEPS)
     assert effective == EFFECTIVE_REPEATED_DIFFUSION_STEPS
 
-    source = (REPO_ROOT / "starVLA" / "model" / "framework" / "VLA_JEPA.py").read_text()
+    source = (REPO_ROOT / "starVLA" / "model" / "framework" / "VLM4A" / "VLA_JEPA.py").read_text()
     assert 'self.config.trainer.get("repeated_diffusion_steps", 4)' in source
